@@ -219,7 +219,7 @@ function structureEngine(candles, left = 3, right = 3) {
 }
 
 /* ---------- NIVELES / GESTION (compartido) ---------- */
-function buildLevels(dir, live, A, stopPrice, tf15, tf1h) {
+function buildLevels(dir, live, A, stopPrice, tf15, tf1h, strict) {
   const entry = live;
   if (dir === "long") {
     const stop = stopPrice;
@@ -229,12 +229,15 @@ function buildLevels(dir, live, A, stopPrice, tf15, tf1h) {
       .filter((x) => x > entry * 1.001)
       .sort((a, b) => a - b)[0] ?? null;
     const roomR = ceiling ? (ceiling - entry) / risk : null;
+    let warning = null;
     if (roomR !== null && roomR < 1.5) {
-      return { blocked: true, reason: `Techo estructural en ${fmt(ceiling)} a solo ${roomR.toFixed(2)}R. No cumple el minimo 1:1.5 de recorrido libre.`, roomR, ceiling };
+      const reason = `Techo estructural en ${fmt(ceiling)} a solo ${roomR.toFixed(2)}R. No cumple el minimo 1:1.5 de recorrido libre.`;
+      if (strict) return { blocked: true, reason, roomR, ceiling };
+      warning = reason;
     }
     const stopPct = ((entry - stop) / entry) * 100;
     return {
-      entry, zone: [live - 0.4 * A, live], stop, roomR, ceiling,
+      entry, zone: [live - 0.4 * A, live], stop, roomR, ceiling, warning,
       tps: [
         { pct: 40, price: entry + risk * 1.0, r: 1.0 },
         { pct: 35, price: entry + risk * 1.8, r: 1.8 },
@@ -251,12 +254,15 @@ function buildLevels(dir, live, A, stopPrice, tf15, tf1h) {
     .filter((x) => x < entry * 0.999)
     .sort((a, b) => b - a)[0] ?? null;
   const roomR = floor ? (entry - floor) / risk : null;
+  let warning = null;
   if (roomR !== null && roomR < 1.5) {
-    return { blocked: true, reason: `Piso estructural en ${fmt(floor)} a solo ${roomR.toFixed(2)}R. No cumple el minimo 1:1.5 de recorrido libre.`, roomR, ceiling: floor };
+    const reason = `Piso estructural en ${fmt(floor)} a solo ${roomR.toFixed(2)}R. No cumple el minimo 1:1.5 de recorrido libre.`;
+    if (strict) return { blocked: true, reason, roomR, ceiling: floor };
+    warning = reason;
   }
   const stopPct = ((stop - entry) / entry) * 100;
   return {
-    entry, zone: [live, live + 0.4 * A], stop, roomR, ceiling: floor,
+    entry, zone: [live, live + 0.4 * A], stop, roomR, ceiling: floor, warning,
     tps: [
       { pct: 40, price: entry - risk * 1.0, r: 1.0 },
       { pct: 35, price: entry - risk * 1.8, r: 1.8 },
@@ -268,9 +274,11 @@ function buildLevels(dir, live, A, stopPrice, tf15, tf1h) {
 }
 
 /* ---------- ESTRATEGIA 1: INDICADORES (EMAs, RSI, MACD, Bollinger) ---------- */
-function buildIndicatorSignal(tf15, tf1h, tf4h, live, ind) {
+function buildIndicatorSignal(tf15, tf1h, tf4h, live, ind, riskMode) {
+  const strict = riskMode !== "flexible";
   const core = [];
   const contexto = [];
+  const warnings = [];
   let bull = 0, bear = 0;
   let allowLong = true, allowShort = true;
 
@@ -355,25 +363,31 @@ function buildIndicatorSignal(tf15, tf1h, tf4h, live, ind) {
     d: "flat",
   });
 
-  let signal = "SIN OPERAR", dir = null, invalidation = "";
+  let signal = "SIN OPERAR", dir = null, invalidation = "", blockedDir = null;
   const needed = Math.max(1, Math.ceil((nEnabled * 2) / 3));
 
   if (nEnabled === 0) {
     invalidation = "Activa al menos un indicador para generar senales.";
   } else if (bull >= needed && bull > bear) {
-    if (!allowLong) {
-      invalidation = "Confluencia alcista pero con sobrecompra/sobreextension: entrar aqui es perseguir. Esperar retroceso.";
-    } else if (bias === "BAJISTA") {
-      invalidation = "Confluencia alcista en 15m pero el sesgo 4h/1h es BAJISTA: no operar contra la tendencia mayor.";
+    const razones = [];
+    if (!allowLong) razones.push("hay sobrecompra/sobreextension (entrar aqui es perseguir)");
+    if (bias === "BAJISTA") razones.push("el sesgo 4h/1h es BAJISTA (contra la tendencia mayor)");
+    if (razones.length && strict) {
+      blockedDir = "long";
+      invalidation = `Confluencia alcista (${bull} de ${nEnabled} votos) pero ${razones.join(" y ")}.`;
     } else {
+      razones.forEach((r) => warnings.push(`Advertencia: ${r}.`));
       signal = "LARGO"; dir = "long";
     }
   } else if (bear >= needed && bear > bull) {
-    if (!allowShort) {
-      invalidation = "Confluencia bajista pero con sobreventa/sobreextension: vender la capitulacion es mal negocio. Esperar rebote.";
-    } else if (bias === "ALCISTA") {
-      invalidation = "Confluencia bajista en 15m pero el sesgo 4h/1h es ALCISTA: no operar contra la tendencia mayor.";
+    const razones = [];
+    if (!allowShort) razones.push("hay sobreventa/sobreextension (vender la capitulacion es mal negocio)");
+    if (bias === "ALCISTA") razones.push("el sesgo 4h/1h es ALCISTA (contra la tendencia mayor)");
+    if (razones.length && strict) {
+      blockedDir = "short";
+      invalidation = `Confluencia bajista (${bear} de ${nEnabled} votos) pero ${razones.join(" y ")}.`;
     } else {
+      razones.forEach((r) => warnings.push(`Advertencia: ${r}.`));
       signal = "CORTO"; dir = "short";
     }
   }
@@ -381,35 +395,41 @@ function buildIndicatorSignal(tf15, tf1h, tf4h, live, ind) {
   const A = tf15.atr || live * 0.01;
   const extATR = tf15.atr ? (live - tf15.ema21) / tf15.atr : 0;
   if (dir === "long" && extATR > 3) {
-    signal = "SIN OPERAR"; dir = null;
-    invalidation = `Sobreextendido: ${extATR.toFixed(1)} ATR sobre la EMA21. El movimiento ya corrio; esperar retroceso hacia EMA9/21.`;
+    const msg = `Sobreextendido: ${extATR.toFixed(1)} ATR sobre la EMA21. El movimiento ya corrio; lo sano es esperar retroceso hacia EMA9/21.`;
+    if (strict) { signal = "SIN OPERAR"; dir = null; blockedDir = "long"; invalidation = msg; }
+    else warnings.push(msg);
   }
   if (dir === "short" && extATR < -3) {
-    signal = "SIN OPERAR"; dir = null;
-    invalidation = `Sobreextendido a la baja: ${Math.abs(extATR).toFixed(1)} ATR bajo la EMA21. Esperar el rebote tecnico antes de vender.`;
+    const msg = `Sobreextendido a la baja: ${Math.abs(extATR).toFixed(1)} ATR bajo la EMA21. Lo sano es esperar el rebote tecnico antes de vender.`;
+    if (strict) { signal = "SIN OPERAR"; dir = null; blockedDir = "short"; invalidation = msg; }
+    else warnings.push(msg);
+  }
+
+  let levels = {};
+  if (dir === "long") {
+    levels = buildLevels("long", live, A, Math.min(live - 1.8 * A, tf15.support * 0.998), tf15, tf1h, strict);
+  } else if (dir === "short") {
+    levels = buildLevels("short", live, A, Math.max(live + 1.8 * A, tf15.resistance * 1.002), tf15, tf1h, strict);
+  }
+  if (levels.blocked) {
+    blockedDir = dir; signal = "SIN OPERAR"; dir = null;
+    invalidation = levels.reason;
+    levels = { roomR: levels.roomR, ceiling: levels.ceiling };
+  } else if (levels.warning) {
+    warnings.push(levels.warning);
   }
 
   let confidence = "-";
   if (dir) {
     const ratio = (dir === "long" ? bull : bear) / nEnabled;
     confidence = ratio >= 1 ? "ALTA" : ratio >= 0.75 ? "MEDIA" : "BAJA";
-  }
-
-  let levels = {};
-  if (dir === "long") {
-    levels = buildLevels("long", live, A, Math.min(live - 1.8 * A, tf15.support * 0.998), tf15, tf1h);
-  } else if (dir === "short") {
-    levels = buildLevels("short", live, A, Math.max(live + 1.8 * A, tf15.resistance * 1.002), tf15, tf1h);
-  }
-  if (levels.blocked) {
-    signal = "SIN OPERAR"; dir = null;
-    invalidation = levels.reason;
-    levels = { roomR: levels.roomR, ceiling: levels.ceiling };
+    if (warnings.length >= 2) confidence = "BAJA";
+    else if (warnings.length === 1 && confidence === "ALTA") confidence = "MEDIA";
   }
 
   return {
     modo: "indicadores", bias, signal, dir, tipo: "confluencia", confidence,
-    core, contexto, bull, bear, nEnabled, needed,
+    core, contexto, bull, bear, nEnabled, needed, warnings, blockedDir, riskMode,
     entry: levels.entry ?? null, zone: levels.zone ?? null, stop: levels.stop ?? null,
     tps: levels.tps ?? [], roomR: levels.roomR ?? null, ceiling: levels.ceiling ?? null,
     maxLev: levels.maxLev ?? null,
@@ -419,18 +439,20 @@ function buildIndicatorSignal(tf15, tf1h, tf4h, live, ind) {
 }
 
 /* ---------- ESTRATEGIA 2: ESTRUCTURA (BOS / CHoCH) ---------- */
-function buildStructureSignal(c15, tf15, c1h, tf1h, live) {
+function buildStructureSignal(c15, tf15, c1h, tf1h, live, riskMode) {
+  const strict = riskMode !== "flexible";
   const st = structureEngine(c15);
   const st1h = structureEngine(c1h);
   const bias = st1h.trend === 1 ? "ALCISTA" : st1h.trend === -1 ? "BAJISTA" : "RANGO";
   const A = tf15.atr || live * 0.01;
   const extATR = tf15.atr ? (live - tf15.ema21) / tf15.atr : 0;
+  const warnings = [];
 
   const lastEv = st.events.length ? st.events[st.events.length - 1] : null;
   const age = lastEv ? st.n - 1 - lastEv.t : null;
   const RECENT = 12; // ~3 horas en 15m
 
-  let signal = "SIN OPERAR", dir = null, confidence = "-", invalidation = "";
+  let signal = "SIN OPERAR", dir = null, confidence = "-", invalidation = "", blockedDir = null;
 
   if (!lastEv) {
     invalidation = "Sin eventos de estructura (BOS/CHoCH) en las velas analizadas.";
@@ -438,48 +460,61 @@ function buildStructureSignal(c15, tf15, c1h, tf1h, live) {
     invalidation = `Ultimo evento: ${lastEv.type} en ${fmt(lastEv.level)} hace ${age} velas de 15m - ya no es accionable. Esperar un nuevo BOS o CHoCH.`;
   } else if (lastEv.dir === "up") {
     const isBos = lastEv.type.startsWith("BOS");
-    if (isBos && st1h.trend === -1) {
+    if (isBos && st1h.trend === -1 && strict) {
+      blockedDir = "long";
       invalidation = `BOS alcista en 15m (hace ${age} velas) pero la estructura 1h sigue bajista: ruptura contra la tendencia mayor. Mejor esperar CHoCH tambien en 1h.`;
     } else {
+      if (isBos && st1h.trend === -1) warnings.push("Advertencia: BOS alcista contra la estructura bajista de 1h.");
       signal = "LARGO"; dir = "long";
       confidence = isBos ? (st1h.trend === 1 ? "ALTA" : "MEDIA") : (st1h.trend === -1 ? "BAJA" : "MEDIA");
     }
   } else {
     const isBos = lastEv.type.startsWith("BOS");
-    if (isBos && st1h.trend === 1) {
+    if (isBos && st1h.trend === 1 && strict) {
+      blockedDir = "short";
       invalidation = `BOS bajista en 15m (hace ${age} velas) pero la estructura 1h sigue alcista: ruptura contra la tendencia mayor. Mejor esperar CHoCH tambien en 1h.`;
     } else {
+      if (isBos && st1h.trend === 1) warnings.push("Advertencia: BOS bajista contra la estructura alcista de 1h.");
       signal = "CORTO"; dir = "short";
       confidence = isBos ? (st1h.trend === -1 ? "ALTA" : "MEDIA") : (st1h.trend === 1 ? "BAJA" : "MEDIA");
     }
   }
 
   if (dir === "long" && extATR > 3) {
-    signal = "SIN OPERAR"; dir = null; confidence = "-";
-    invalidation = `${lastEv.type} valido pero el precio esta ${extATR.toFixed(1)} ATR sobre la EMA21: perseguir la ruptura aqui es entrar tarde. Esperar el retest del nivel ${fmt(lastEv.level)}.`;
+    const msg = `${lastEv.type} valido pero el precio esta ${extATR.toFixed(1)} ATR sobre la EMA21: perseguir la ruptura aqui es entrar tarde. Lo sano es esperar el retest del nivel ${fmt(lastEv.level)}.`;
+    if (strict) { signal = "SIN OPERAR"; dir = null; confidence = "-"; blockedDir = "long"; invalidation = msg; }
+    else warnings.push(msg);
   }
   if (dir === "short" && extATR < -3) {
-    signal = "SIN OPERAR"; dir = null; confidence = "-";
-    invalidation = `${lastEv.type} valido pero el precio esta ${Math.abs(extATR).toFixed(1)} ATR bajo la EMA21. Esperar el retest del nivel ${fmt(lastEv.level)}.`;
+    const msg = `${lastEv.type} valido pero el precio esta ${Math.abs(extATR).toFixed(1)} ATR bajo la EMA21. Lo sano es esperar el retest del nivel ${fmt(lastEv.level)}.`;
+    if (strict) { signal = "SIN OPERAR"; dir = null; confidence = "-"; blockedDir = "short"; invalidation = msg; }
+    else warnings.push(msg);
   }
 
   let levels = {};
   if (dir === "long") {
     const swingLow = st.lastL ? st.lastL.price : live - 1.8 * A;
-    levels = buildLevels("long", live, A, Math.min(swingLow * 0.998, live - 0.8 * A), tf15, tf1h);
+    levels = buildLevels("long", live, A, Math.min(swingLow * 0.998, live - 0.8 * A), tf15, tf1h, strict);
   } else if (dir === "short") {
     const swingHigh = st.lastH ? st.lastH.price : live + 1.8 * A;
-    levels = buildLevels("short", live, A, Math.max(swingHigh * 1.002, live + 0.8 * A), tf15, tf1h);
+    levels = buildLevels("short", live, A, Math.max(swingHigh * 1.002, live + 0.8 * A), tf15, tf1h, strict);
   }
   if (levels.blocked) {
-    signal = "SIN OPERAR"; dir = null; confidence = "-";
+    blockedDir = dir; signal = "SIN OPERAR"; dir = null; confidence = "-";
     invalidation = levels.reason;
     levels = { roomR: levels.roomR, ceiling: levels.ceiling };
+  } else if (levels.warning) {
+    warnings.push(levels.warning);
+  }
+
+  if (dir && warnings.length) {
+    if (warnings.length >= 2) confidence = "BAJA";
+    else if (confidence === "ALTA") confidence = "MEDIA";
   }
 
   return {
     modo: "estructura", bias, signal, dir, tipo: "estructura", confidence,
-    core: [], contexto: [], bull: 0, bear: 0,
+    core: [], contexto: [], bull: 0, bear: 0, warnings, blockedDir, riskMode,
     structure: st, structure1h: st1h,
     lastEvent: lastEv ? { ...lastEv, age } : null,
     entry: levels.entry ?? null, zone: levels.zone ?? null, stop: levels.stop ?? null,
@@ -503,6 +538,18 @@ const STABLES = new Set([
   "EURUSDT", "AEURUSDT", "EURIUSDT", "XUSDUSDT",
 ]);
 
+// Clasificacion por tipo de activo en Binance spot. Listas editables:
+// agrega aqui los simbolos si Binance lista nuevos activos tokenizados.
+const COMMODITIES = new Set(["PAXGUSDT"]); // Pax Gold (oro tokenizado)
+const STOCK_TOKENS = new Set([]); // Binance retiro los stock tokens del spot; vacio por ahora
+const assetCat = (sym) =>
+  COMMODITIES.has(sym) ? "commodities" : STOCK_TOKENS.has(sym) ? "acciones" : "cripto";
+
+const CAT_LABELS = [
+  ["todos", "TODOS"], ["cripto", "CRIPTO"],
+  ["commodities", "MATERIAS PRIMAS"], ["acciones", "ACCIONES"],
+];
+
 const trendTxt = (t) => (t === 1 ? "ALCISTA" : t === -1 ? "BAJISTA" : "SIN DEFINIR");
 
 export default function BinanceCopiloto() {
@@ -519,6 +566,8 @@ export default function BinanceCopiloto() {
   const [minVol, setMinVol] = useState(1000000);
   const [strategy, setStrategy] = useState("indicadores");
   const [ind, setInd] = useState({ emas: true, rsi: true, macd: true, boll: true });
+  const [riskMode, setRiskMode] = useState("estricto");
+  const [cat, setCat] = useState("todos");
 
   const scan = useCallback(async () => {
     setScanning(true); setErr(null);
@@ -538,6 +587,7 @@ export default function BinanceCopiloto() {
             change: parseFloat(t.priceChangePercent),
             quoteVol: parseFloat(t.quoteVolume), high, low,
             rangePos: range > 0 ? (lastP - low) / range : 0.5,
+            cat: assetCat(t.symbol),
           };
         })
         .filter((t) => t.quoteVol >= minVol && t.price > 0);
@@ -550,19 +600,24 @@ export default function BinanceCopiloto() {
 
   useEffect(() => { scan(); }, []);
 
+  const visibleTickers = useMemo(
+    () => (cat === "todos" ? tickers : tickers.filter((t) => t.cat === cat)),
+    [tickers, cat]
+  );
+
   const top3 = useMemo(() => {
-    if (!tickers.length) return [];
-    const mom = [...tickers].filter((t) => Math.abs(t.change) > 3)
+    if (!visibleTickers.length) return [];
+    const mom = [...visibleTickers].filter((t) => Math.abs(t.change) > 3)
       .map((t) => ({ ...t, tipo: "momentum", dir: t.change > 0 ? "LARGO" : "CORTO", score: Math.abs(t.change) * Math.log10(t.quoteVol) }))
       .sort((a, b) => b.score - a.score).slice(0, 6);
-    const rev = [...tickers].filter((t) => t.rangePos < 0.08 || t.rangePos > 0.92)
+    const rev = [...visibleTickers].filter((t) => t.rangePos < 0.08 || t.rangePos > 0.92)
       .map((t) => ({ ...t, tipo: "reversion", dir: t.rangePos < 0.08 ? "LARGO" : "CORTO", score: Math.log10(t.quoteVol) * 2 }))
       .sort((a, b) => b.score - a.score).slice(0, 6);
     const seen = new Set();
     return [...mom, ...rev]
       .filter((t) => { if (seen.has(t.symbol)) return false; seen.add(t.symbol); return true; })
       .sort((a, b) => b.score - a.score).slice(0, 3);
-  }, [tickers]);
+  }, [visibleTickers]);
 
   const fetchCandles = async (sym, interval, limit = 300) => {
     const raw = await fetchJson(`/klines?symbol=${sym}&interval=${interval}&limit=${limit}`);
@@ -595,10 +650,10 @@ export default function BinanceCopiloto() {
     const t1h = analyzeTF(c1hc);
     const t4h = analyzeTF(closed(market.c4h));
     const sig = strategy === "estructura"
-      ? buildStructureSignal(c15c, t15, c1hc, t1h, market.live)
-      : buildIndicatorSignal(t15, t1h, t4h, market.live, ind);
+      ? buildStructureSignal(c15c, t15, c1hc, t1h, market.live, riskMode)
+      : buildIndicatorSignal(t15, t1h, t4h, market.live, ind, riskMode);
     return { symbol: market.symbol, time: market.time, live: market.live, tf15: t15, tf1h: t1h, tf4h: t4h, ...sig };
-  }, [market, strategy, ind]);
+  }, [market, strategy, ind, riskMode]);
 
   const btcCtx = useMemo(() => {
     if (!market) return null;
@@ -692,10 +747,39 @@ export default function BinanceCopiloto() {
             </button>
             {scanTime && (
               <div style={{ color: C.dim, fontSize: 11 }}>
-                {tickers.length} pares · {scanTime.toLocaleTimeString("es-CO")}
+                {visibleTickers.length} pares · {scanTime.toLocaleTimeString("es-CO")}
               </div>
             )}
           </div>
+
+          <div style={{
+            display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center",
+            background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "10px 12px",
+          }}>
+            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>TIPO DE ACTIVO:</span>
+            {CAT_LABELS.map(([k, l]) => (
+              <button key={k} onClick={() => setCat(k)} style={{
+                background: cat === k ? C.amber : "transparent",
+                color: cat === k ? "#2d2000" : C.dim,
+                border: `1px solid ${cat === k ? C.amber : C.border}`,
+                padding: "5px 12px", borderRadius: 4, cursor: "pointer",
+                fontSize: 11, fontWeight: 700, fontFamily: "inherit",
+              }}>{l}</button>
+            ))}
+          </div>
+
+          {tickers.length > 0 && visibleTickers.length === 0 && (
+            <div style={{
+              color: C.dim, padding: 24, textAlign: "center",
+              border: `1px dashed ${C.border}`, borderRadius: 4, marginBottom: 16, fontSize: 12, lineHeight: 1.6,
+            }}>
+              {cat === "acciones"
+                ? "Binance retiro los stock tokens (acciones tokenizadas) del mercado spot, asi que hoy no hay pares de acciones disponibles. Si los vuelve a listar, se agregan a la lista STOCK_TOKENS del codigo."
+                : cat === "commodities"
+                  ? "Sin pares de materias primas que superen el volumen minimo. El principal es PAXG (oro tokenizado); prueba bajando el filtro de volumen."
+                  : "Sin pares en esta categoria con el filtro de volumen actual."}
+            </div>
+          )}
 
           {top3.length > 0 && (
             <>
@@ -730,7 +814,7 @@ export default function BinanceCopiloto() {
             </>
           )}
 
-          {tickers.length > 0 && (
+          {visibleTickers.length > 0 && (
             <>
               <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
                 MERCADO - TOP 40 POR VOLUMEN
@@ -748,7 +832,7 @@ export default function BinanceCopiloto() {
                     </tr>
                   </thead>
                   <tbody>
-                    {[...tickers].sort((a, b) => b.quoteVol - a.quoteVol).slice(0, 40).map((t) => (
+                    {[...visibleTickers].sort((a, b) => b.quoteVol - a.quoteVol).slice(0, 40).map((t) => (
                       <tr key={t.symbol} style={{ borderTop: `1px solid ${C.border}` }}>
                         <td style={{ padding: "7px 12px", fontWeight: 600 }}>{t.symbol}</td>
                         <td style={{ padding: "7px 12px" }}>{fmt(t.price)}</td>
@@ -834,6 +918,16 @@ export default function BinanceCopiloto() {
                 ))}
               </>
             )}
+            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginLeft: 8 }}>FILTRO DE RIESGO:</span>
+            {[["estricto", "ESTRICTO"], ["flexible", "FLEXIBLE"]].map(([k, l]) => (
+              <button key={k} onClick={() => setRiskMode(k)} style={{
+                background: riskMode === k ? (k === "estricto" ? "#0d2620" : "#2d2000") : "transparent",
+                color: riskMode === k ? (k === "estricto" ? C.green : C.amber) : C.dim,
+                border: `1px solid ${riskMode === k ? (k === "estricto" ? C.green : C.amber) : C.border}`,
+                padding: "5px 12px", borderRadius: 4, cursor: "pointer",
+                fontSize: 11, fontWeight: 700, fontFamily: "inherit",
+              }}>{l}</button>
+            ))}
           </div>
 
           {!analysis && !analyzing && (
@@ -861,6 +955,11 @@ export default function BinanceCopiloto() {
                   </div>
                   <div style={{ textAlign: "right" }}>
                     <div style={{ fontSize: 24, fontWeight: 700, color: sigColor }}>{analysis.signal}</div>
+                    {analysis.blockedDir && (
+                      <div style={{ color: C.amber, fontSize: 11, marginTop: 2 }}>
+                        senal {analysis.blockedDir === "long" ? "ALCISTA" : "BAJISTA"} bloqueada por filtro de riesgo
+                      </div>
+                    )}
                     <div style={{ color: C.dim, fontSize: 11, marginTop: 4 }}>
                       Estrategia: {analysis.modo} · Confianza: {analysis.confidence}
                     </div>
@@ -1105,16 +1204,44 @@ export default function BinanceCopiloto() {
                 </div>
               ) : (
                 <div style={{
-                  background: C.panel, border: `1px solid ${C.border}`, borderLeft: `4px solid ${C.dim}`,
+                  background: C.panel, border: `1px solid ${C.border}`,
+                  borderLeft: `4px solid ${analysis.blockedDir ? C.amber : C.dim}`,
                   borderRadius: 4, padding: 18,
                 }}>
-                  <div style={{ fontWeight: 700, marginBottom: 8 }}>SIN OPERAR</div>
+                  <div style={{ fontWeight: 700, marginBottom: 8 }}>
+                    SIN OPERAR
+                    {analysis.blockedDir && (
+                      <span style={{ color: C.amber }}>
+                        {" "}· senal {analysis.blockedDir === "long" ? "ALCISTA" : "BAJISTA"} bloqueada
+                      </span>
+                    )}
+                  </div>
                   <div style={{ color: C.dim, fontSize: 12, lineHeight: 1.6 }}>
                     {analysis.invalidation ||
                       (analysis.modo === "indicadores"
                         ? `Sin confluencia suficiente: ${analysis.bull} alcistas / ${analysis.bear} bajistas de ${analysis.nEnabled} indicadores (se requieren ${analysis.needed} en la misma direccion). Esperar es una posicion valida.`
                         : "Sin evento de estructura accionable. Esperar es una posicion valida.")}
                   </div>
+                  {analysis.blockedDir && analysis.riskMode === "estricto" && (
+                    <div style={{ marginTop: 10, fontSize: 11, color: C.amber, lineHeight: 1.5 }}>
+                      La senal existe pero un filtro de riesgo la freno. Si quieres ver igualmente los
+                      niveles del setup (bajo tu criterio), cambia el FILTRO DE RIESGO a FLEXIBLE arriba.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {analysis.dir && analysis.warnings?.length > 0 && (
+                <div style={{
+                  marginTop: 14, padding: 12, background: "#2d2000", border: `1px solid ${C.amber}`,
+                  borderRadius: 4, fontSize: 12, color: "#ffe9a8", lineHeight: 1.6,
+                }}>
+                  <div style={{ fontWeight: 700, marginBottom: 6, color: C.amber }}>
+                    ADVERTENCIAS (modo flexible - setup de menor calidad)
+                  </div>
+                  {analysis.warnings.map((w, i) => (
+                    <div key={i} style={{ marginBottom: 4 }}>• {w}</div>
+                  ))}
                 </div>
               )}
 
