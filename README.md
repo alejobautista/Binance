@@ -5,8 +5,10 @@ Herramienta de análisis técnico para pares USDT de Binance Spot. Calcula seña
 ## Funcionalidades
 
 - **Escáner de mercado**: filtra pares USDT por volumen 24h, detecta oportunidades de momentum y reversión, y muestra el top 40 por volumen.
-- **Análisis multi-timeframe** (15m / 1h / 4h): EMA 9/21/50/200, RSI 14, MACD, ATR, OBV, StochRSI, Bandas de Bollinger, niveles Fibonacci y soportes/resistencias.
-- **Motor de señales**: confluencia de indicadores núcleo + confirmaciones extra, con sesgo de timeframes mayores y contexto de BTC.
+- **Dos estrategias seleccionables**:
+  - **Indicadores**: confluencia de EMAs 9/21, RSI 14, MACD y Bandas de Bollinger — cada indicador se puede activar o desactivar individualmente.
+  - **Estructura (BOS/CHoCH)**: detección de pivotes HH/HL/LH/LL sobre velas cerradas, con eventos BOS (rompimiento a favor de tendencia) y CHoCH+/− (cambio de carácter). La estructura de 1h actúa como filtro de sesgo.
+- **Análisis multi-timeframe** (15m / 1h / 4h) con sesgo de timeframes mayores y contexto de BTC.
 - **Gestión de riesgo**: zona de entrada, stop-loss por ATR, take-profits escalonados (1R/1.8R/3R), apalancamiento máximo seguro y cálculo de tamaño de posición según capital y % de riesgo.
 
 ## Cómo correrlo
