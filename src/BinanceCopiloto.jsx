@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { fetchJson, fetchCandles, fetchDepth, analyzeDepth, fmt, fmtQ, evaluate, analyzeTF } from "./signalCore.js";
+import { fetchJson, fetchCandles, fetchDepth, analyzeDepth, fmt, fmtQ, evaluate, evaluateAll, analyzeTF, STRATEGIES } from "./signalCore.js";
 import { STABLES, assetCat, CAT_LABELS, SUBCAT_LABELS, subCat } from "./categories.js";
 import {
   recordSignal, markTaken, getSignals, probability, resolveOpenSignals,
@@ -28,6 +28,12 @@ const HELP = {
   flujo: "A diferencia del libro (ordenes en espera, cancelables), esto es volumen YA EJECUTADO: que porcentaje de lo negociado fue comprado con ordenes de mercado (agresores). Mas del 55% sostenido = presion compradora real; menos del 45% = vendedora. No se puede fingir porque son operaciones cerradas.",
   posiciones: "Tus senales marcadas con LA TOME que siguen abiertas. Muestra el precio actual contra la entrada registrada, el avance en R (1R = la distancia de tu stop) y te avisa cuando toca mover el stop a break-even. Los datos se resuelven definitivamente con VERIFICAR RESULTADOS.",
   curva: "Cada punto es una senal resuelta, en orden temporal; la altura es la suma de R ganados/perdidos hasta ahi. Una curva que sube de forma sostenida = el motor tiene ventaja; una que baja o va plana = no la tiene (y la probabilidad te lo reflejara). La linea ambar es la muestra del backtest; la verde, senales en vivo.",
+  ichimoku: "Sistema japones completo (Hosoda, 1969). Entrada por TRIPLE confirmacion: precio fuera de la nube (Kumo) + cruce Tenkan/Kijun a favor + Chikou libre del precio de hace 26 velas; los cruces DENTRO de la nube se ignoran siempre. El stop va en la Kijun-sen o al otro lado de la nube. Fuerte en tendencias limpias, casi inutil en rangos. Evidencia mixta: 53.7% de aciertos en forex vs 10% en un test de acciones - depende del activo, valida con el backtest.",
+  keltner: "Reversion a la media: tras un extremo (banda Keltner de 3.9 ATR sobre EMA50) se espera el resorte de vuelta al centro. Entrada: extremo tocado + re-entrada confirmada sobre/bajo la banda 2.7 + CCI cruzando ±40. Solo apta cuando NO hay tendencia fuerte: con ADX ≥30 se bloquea (en estricto), porque comprar cada toque de banda en una tendencia es ponerse delante de un tren.",
+  donchian: "Sistema Turtle (Dennis/Eckhardt, 1983): comprar fuerza, vender debilidad. Entrada: CIERRE fuera del canal de 55 velas + ADX>25 + DMI a favor; volumen >150% de la media da conviccion. Stop inicial: 2 ATR (2N). Advertencia honesta: historicamente acierta solo 35-40% de las veces - gana porque los aciertos son 3-5 veces mas grandes que las perdidas, no por acertar mucho. Exige estomago para rachas perdedoras.",
+  supertrend: "Confluencia de tres sistemas de Wilder/volatilidad: SuperTrend (10, 3.0) da direccion, ADX/DMI da fuerza (>25) y el Parabolic SAR acompana como trailing. Regla de oro: ADX<20 = sistema APAGADO (el 60% de los flips del SAR en rango pierden). El stop usa la linea SuperTrend/SAR, que se mueve con el precio.",
+  avwap: "Flujo de dinero institucional (Brian Shannon): el VWAP anclado al minimo/maximo del swing muestra quien controla desde ese evento; CMF>+0.05 confirma acumulacion real y el MFI evita comprar sobrecompra de flujo. Filosofia: comprar fuerza DESPUES del retroceso, no perseguir extension (>2.5 ATR del ancla = advertencia). Dos cierres contra el AVWAP invalidan la tesis.",
+  senales: "Cada vez que escaneas, la app corre las 7 estrategias sobre los pares con mas volumen del filtro activo. Aqui aparece cada senal con la ESTRATEGIA que la pidio y su probabilidad historica. Todas se registran automaticamente en el Record y se verifican contra el precio real aunque tu no las operes - asi el motor aprende que estrategia funciona en que mercado.",
 };
 
 function Help({ k }) {
@@ -62,14 +68,16 @@ const trendTxt = (t) => (t === 1 ? "ALCISTA" : t === -1 ? "BAJISTA" : "SIN DEFIN
 const CONF_RANK = { ALTA: 3, MEDIA: 2, BAJA: 1 };
 
 const FACTOR_LABELS = {
-  sesgo: "sesgo 4h/1h", "estrategia:estructura": "estrategia estructura", "dir:corto": "direccion corto",
+  sesgo: "sesgo 4h/1h", "dir:corto": "direccion corto",
   "conf:alta": "confianza alta", "conf:baja": "confianza baja", rsi: "nivel de RSI",
   volumen: "volumen relativo", extension: "extension vs EMA21", "evento:bos": "evento BOS",
   "evento:choch": "evento CHoCH", advertencias: "advertencias activas",
   "hora:sin": "hora del dia", "hora:cos": "hora del dia",
 };
 const factorLabel = (name) =>
-  FACTOR_LABELS[name] ?? (name.startsWith("subcat:") ? `categoria ${name.slice(7)}` : name);
+  FACTOR_LABELS[name] ??
+  (name.startsWith("subcat:") ? `categoria ${name.slice(7)}`
+    : name.startsWith("estrategia:") ? `estrategia ${name.slice(11)}` : name);
 
 export default function BinanceCopiloto() {
   const [tab, setTab] = useState("scan");
@@ -159,37 +167,46 @@ export default function BinanceCopiloto() {
     return data;
   }, []);
 
-  // TOP 3 con el motor real: corre la estrategia activa sobre los candidatos del filtro.
+  // Corre TODAS las estrategias sobre los candidatos del filtro. Cada senal se
+  // registra en el Record (con dedupe) para verificarse aunque no se ejecute.
+  const [scanSignals, setScanSignals] = useState([]);
   const computeTop3 = useCallback(async () => {
-    if (!visibleTickers.length) { setTop3Sig([]); setTop3Msg(null); return; }
+    if (!visibleTickers.length) { setTop3Sig([]); setScanSignals([]); setTop3Msg(null); return; }
     setTop3Busy(true); setTop3Msg(null);
     try {
       const candidates = [...visibleTickers].sort((a, b) => b.quoteVol - a.quoteVol).slice(0, 12);
       const results = [];
+      let recorded = 0;
       for (let i = 0; i < candidates.length; i += 4) {
         const batch = candidates.slice(i, i + 4);
         const settled = await Promise.allSettled(batch.map(async (t) => {
           const { c15, c1h, c4h } = await getCandlesCached(t.symbol);
           const live = c15[c15.length - 1].close;
-          const sig = evaluate(c15, c1h, c4h, live, strategy, ind, riskMode);
-          if (!sig.dir) return null;
-          return { symbol: t.symbol, live, sig, prob: probability(sig, t.symbol) };
+          const rows = [];
+          for (const { strategy: st, sig } of evaluateAll(c15, c1h, c4h, live, ind, riskMode)) {
+            if (!sig.dir) continue;
+            if (recordSignal(sig, t.symbol, live)) recorded++;
+            rows.push({ symbol: t.symbol, live, strategy: st, sig, prob: probability(sig, t.symbol) });
+          }
+          return rows;
         }));
-        settled.forEach((s) => { if (s.status === "fulfilled" && s.value) results.push(s.value); });
+        settled.forEach((s) => { if (s.status === "fulfilled" && s.value) results.push(...s.value); });
       }
       results.sort((a, b) =>
         ((b.prob?.p ?? 0.5) - (a.prob?.p ?? 0.5)) ||
         ((CONF_RANK[b.sig.confidence] ?? 0) - (CONF_RANK[a.sig.confidence] ?? 0))
       );
+      setScanSignals(results);
       setTop3Sig(results.slice(0, 3));
+      if (recorded) setTrackerTick((t) => t + 1);
       if (!results.length) {
-        setTop3Msg(`Sin senales ${strategy === "estructura" ? "de estructura" : "de indicadores"} activas en esta categoria ahora mismo. ${riskMode === "estricto" ? "Prueba el filtro FLEXIBLE para ver setups con advertencias." : "Esperar tambien es una posicion."}`);
+        setTop3Msg(`Ninguna de las 7 estrategias tiene senal activa en esta categoria ahora mismo. ${riskMode === "estricto" ? "Prueba el filtro FLEXIBLE para ver setups con advertencias." : "Esperar tambien es una posicion."}`);
       }
     } catch (e) {
-      setTop3Msg(`No se pudo evaluar el Top 3: ${e.message}`);
+      setTop3Msg(`No se pudo evaluar las senales: ${e.message}`);
     }
     setTop3Busy(false);
-  }, [visibleTickers, strategy, ind, riskMode, getCandlesCached]);
+  }, [visibleTickers, ind, riskMode, getCandlesCached]);
 
   // Recalcula el Top 3 al cambiar filtros/estrategia (con debounce).
   useEffect(() => {
@@ -217,6 +234,31 @@ export default function BinanceCopiloto() {
     }
     setAnalyzing(false);
   };
+
+  // Grafico EN VIVO: cada 20s se traen las ultimas velas de 15m y se funden con las
+  // existentes (la vela en formacion se actualiza; al cerrar, la senal se recalcula sola).
+  const [liveMode, setLiveMode] = useState(true);
+  useEffect(() => {
+    if (tab !== "analyze" || !market?.symbol || !liveMode) return;
+    const sym = market.symbol;
+    const id = setInterval(async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      try {
+        const fresh = await fetchCandles(sym, "15m", 3);
+        setMarket((m) => {
+          if (!m || m.symbol !== sym) return m;
+          const c15 = [...m.c15];
+          for (const nc of fresh) {
+            const idx = c15.findIndex((c) => c.time === nc.time);
+            if (idx >= 0) c15[idx] = nc;
+            else if (nc.time > c15[c15.length - 1].time) c15.push(nc);
+          }
+          return { ...m, c15, live: c15[c15.length - 1].close, time: new Date() };
+        });
+      } catch { /* sin red esta vez; se reintenta */ }
+    }, 20000);
+    return () => clearInterval(id);
+  }, [tab, market?.symbol, liveMode]);
 
   const [depthBusy, setDepthBusy] = useState(false);
   const refreshDepth = async () => {
@@ -561,8 +603,8 @@ export default function BinanceCopiloto() {
             display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center",
             background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "10px 12px",
           }}>
-            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>ESTRATEGIA:</span>
-            {[["indicadores", "INDICADORES"], ["estructura", "ESTRUCTURA"]].map(([k, l]) => (
+            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>ESTRATEGIA (para Analisis; el escaner corre TODAS):</span>
+            {STRATEGIES.map(([k, l]) => (
               <button key={k} onClick={() => setStrategy(k)} style={chipS(strategy === k, "amber")}>{l}</button>
             ))}
             {strategy === "indicadores" && INDICATOR_TOGGLES.map(([k, l]) => (
@@ -593,7 +635,7 @@ export default function BinanceCopiloto() {
             <>
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
                 <div style={{ color: C.amber, fontSize: 11, letterSpacing: "0.1em" }}>
-                  TOP 3 SENALES - motor real ({strategy}) segun tus filtros
+                  TOP 3 SENALES - las 7 estrategias corren sobre tus filtros<Help k="senales" />
                 </div>
                 <button onClick={computeTop3} disabled={top3Busy} style={{
                   background: "transparent", border: `1px solid ${C.accent}`, color: C.accent,
@@ -605,7 +647,7 @@ export default function BinanceCopiloto() {
 
               {top3Busy && !top3Sig.length && (
                 <div style={{ color: C.dim, padding: 20, textAlign: "center", border: `1px dashed ${C.border}`, borderRadius: 4, marginBottom: 24, fontSize: 12 }}>
-                  Corriendo la estrategia sobre los candidatos de esta categoria...
+                  Corriendo las 7 estrategias sobre los candidatos de esta categoria...
                 </div>
               )}
 
@@ -616,17 +658,20 @@ export default function BinanceCopiloto() {
               )}
 
               {top3Sig.length > 0 && (
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(250px,1fr))", gap: 12, marginBottom: 24 }}>
-                  {top3Sig.map((t) => (
-                    <div key={t.symbol} style={{
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(250px,1fr))", gap: 12, marginBottom: 14 }}>
+                  {top3Sig.map((t, ti) => (
+                    <div key={`${t.symbol}-${t.strategy}-${ti}`} style={{
                       background: C.panel, border: `1px solid ${C.border}`,
                       borderLeft: `3px solid ${t.sig.dir === "long" ? C.green : C.red}`, borderRadius: 4, padding: 14,
                     }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                         <span style={{ fontWeight: 700, fontSize: 14 }}>{t.symbol}</span>
                         <span style={{ fontWeight: 700, color: t.sig.dir === "long" ? C.green : C.red }}>
                           {t.sig.signal}
                         </span>
+                      </div>
+                      <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.08em", marginBottom: 6, textTransform: "uppercase" }}>
+                        pedida por: {t.strategy}
                       </div>
                       <div style={{ fontSize: 18, marginBottom: 6 }}>{fmt(t.live)}</div>
                       <div style={{ fontSize: 12, marginBottom: 4 }}>
@@ -642,7 +687,7 @@ export default function BinanceCopiloto() {
                       {t.sig.warnings?.length > 0 && (
                         <div style={{ color: C.amber, fontSize: 10, marginTop: 4 }}>⚠ {t.sig.warnings.length} advertencia(s)</div>
                       )}
-                      <button onClick={() => { setSymbol(t.symbol); analyze(t.symbol); }} disabled={analyzing} style={{
+                      <button onClick={() => { setStrategy(t.strategy); setSymbol(t.symbol); analyze(t.symbol); }} disabled={analyzing} style={{
                         background: "transparent", border: `1px solid ${C.accent}`, color: C.accent, marginTop: 10,
                         padding: "6px 12px", borderRadius: 3, cursor: "pointer", fontSize: 11, width: "100%", fontFamily: "inherit",
                       }}>
@@ -651,6 +696,48 @@ export default function BinanceCopiloto() {
                     </div>
                   ))}
                 </div>
+              )}
+
+              {scanSignals.length > 0 && (
+                <>
+                  <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 8 }}>
+                    TODAS LAS SENALES DETECTADAS ({scanSignals.length}) - registradas en el Record automaticamente
+                  </div>
+                  <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, overflow: "auto", maxHeight: 320, marginBottom: 24 }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                      <thead>
+                        <tr style={{ background: C.panel2 }}>
+                          {["PAR", "ESTRATEGIA", "DIR", "CONF", "PROB", "ENTRADA", ""].map((h) => (
+                            <th key={h} style={{ padding: "8px 12px", textAlign: "left", color: C.dim, fontSize: 10, fontWeight: 500, position: "sticky", top: 0, background: C.panel2 }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {scanSignals.map((t, i) => (
+                          <tr key={`${t.symbol}-${t.strategy}-${i}`} style={{ borderTop: `1px solid ${C.border}` }}>
+                            <td style={{ padding: "7px 12px", fontWeight: 600 }}>{t.symbol}</td>
+                            <td style={{ padding: "7px 12px", color: C.amber, fontSize: 11, textTransform: "uppercase" }}>{t.strategy}</td>
+                            <td style={{ padding: "7px 12px", color: t.sig.dir === "long" ? C.green : C.red }}>
+                              {t.sig.dir === "long" ? "LARGO" : "CORTO"}
+                            </td>
+                            <td style={{ padding: "7px 12px", color: C.dim }}>{t.sig.confidence}</td>
+                            <td style={{ padding: "7px 12px", color: C.amber }}>
+                              {t.prob ? `${(t.prob.p * 100).toFixed(0)}%` : "-"}
+                              <span style={{ color: C.dim, fontSize: 10 }}>{t.prob && !t.prob.insuficiente ? ` n=${t.prob.n}` : " n<20"}</span>
+                            </td>
+                            <td style={{ padding: "7px 12px" }}>{fmt(t.sig.entry)}</td>
+                            <td style={{ padding: "7px 12px" }}>
+                              <button onClick={() => { setStrategy(t.strategy); setSymbol(t.symbol); analyze(t.symbol); }} style={{
+                                background: "transparent", border: "none", color: C.accent,
+                                cursor: "pointer", fontSize: 11, fontFamily: "inherit", padding: 0,
+                              }}>ver</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
               )}
 
               <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
@@ -731,7 +818,7 @@ export default function BinanceCopiloto() {
             background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "10px 12px",
           }}>
             <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>ESTRATEGIA:</span>
-            {[["indicadores", "INDICADORES"], ["estructura", "ESTRUCTURA (BOS/CHoCH)"]].map(([k, l]) => (
+            {STRATEGIES.map(([k, l]) => (
               <button key={k} onClick={() => setStrategy(k)} style={chipS(strategy === k, "amber")}>{l}</button>
             ))}
             {strategy === "indicadores" && (
@@ -790,7 +877,7 @@ export default function BinanceCopiloto() {
                           Votos: {analysis.bull} alcistas / {analysis.bear} bajistas (de {analysis.nEnabled}, min {analysis.needed})
                         </div>
                       </>
-                    ) : (
+                    ) : analysis.modo === "estructura" ? (
                       <>
                         <div style={{ color: C.dim, fontSize: 11 }}>Estructura 1h: {analysis.bias}</div>
                         <div style={{ color: C.dim, fontSize: 11 }}>
@@ -798,6 +885,8 @@ export default function BinanceCopiloto() {
                           {analysis.lastEvent ? ` · ${analysis.lastEvent.type} hace ${analysis.lastEvent.age} velas` : ""}
                         </div>
                       </>
+                    ) : (
+                      <div style={{ color: C.dim, fontSize: 11 }}>Sesgo 4h/1h (EMAs): {analysis.bias} · tipo: {analysis.tipo}</div>
                     )}
                   </div>
                 </div>
@@ -806,10 +895,25 @@ export default function BinanceCopiloto() {
 
               {market && (
                 <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14, marginBottom: 14 }}>
-                  <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 8 }}>
-                    GRAFICO 15m - velas cerradas, pivotes y niveles<Help k="chart" />
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
+                    <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em" }}>
+                      GRAFICO 15m - pivotes y niveles<Help k="chart" />
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <span style={{ color: C.dim, fontSize: 10 }}>
+                        {market.time.toLocaleTimeString("es-CO")}
+                      </span>
+                      <button onClick={() => setLiveMode((v) => !v)} style={{
+                        background: liveMode ? "#0d2620" : "transparent",
+                        color: liveMode ? C.green : C.dim,
+                        border: `1px solid ${liveMode ? C.green : C.border}`,
+                        padding: "3px 10px", borderRadius: 3, cursor: "pointer", fontSize: 10, fontFamily: "inherit",
+                      }}>
+                        {liveMode ? "● EN VIVO (20s)" : "○ PAUSADO"}
+                      </button>
+                    </div>
                   </div>
-                  <CandleChart candles={market.c15.slice(0, -1)} sig={analysis} depthInfo={depthInfo} />
+                  <CandleChart candles={market.c15} sig={analysis} depthInfo={depthInfo} />
                   <div style={{ color: C.dim, fontSize: 10, marginTop: 6, lineHeight: 1.5 }}>
                     <span style={{ color: C.amber }}>—</span> EMA9 · <span style={{ color: C.accent }}>—</span> EMA21 ·{" "}
                     <span style={{ color: "#9aa4b2" }}>—</span> EMA50 · punteadas: IN/SL/TP · franjas: muros del libro ·
@@ -988,14 +1092,19 @@ export default function BinanceCopiloto() {
                 </div>
               )}
 
-              {analysis.modo === "indicadores" ? (
+              {analysis.modo !== "estructura" ? (
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 14, marginBottom: 14 }}>
                   <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
                     <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 10 }}>
-                      INDICADORES ACTIVOS - 15m cerrado (deciden la entrada)<Help k="nucleo" />
+                      {analysis.modo === "indicadores"
+                        ? "INDICADORES ACTIVOS - 15m cerrado (deciden la entrada)"
+                        : `CONDICIONES ${analysis.modo.toUpperCase()} - 15m cerrado`}
+                      <Help k={analysis.modo === "indicadores" ? "nucleo" : analysis.modo} />
                     </div>
                     {analysis.core.length === 0 && (
-                      <div style={{ color: C.dim, fontSize: 12 }}>Todos los indicadores estan apagados.</div>
+                      <div style={{ color: C.dim, fontSize: 12 }}>
+                        {analysis.modo === "indicadores" ? "Todos los indicadores estan apagados." : "Sin datos suficientes para esta estrategia."}
+                      </div>
                     )}
                     {analysis.core.map((c, i) => (
                       <div key={i} style={{
@@ -1003,26 +1112,28 @@ export default function BinanceCopiloto() {
                         borderTop: i ? `1px solid ${C.border}` : "none",
                       }}>
                         <Dot d={c.d} />
-                        <span style={{ width: 90, color: C.dim, flexShrink: 0 }}>{c.n}</span>
+                        <span style={{ width: 100, color: C.dim, flexShrink: 0 }}>{c.n}</span>
                         <span style={{ fontSize: 12 }}>{c.v}</span>
                       </div>
                     ))}
                   </div>
-                  <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
-                    <div style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginBottom: 10 }}>
-                      CONTEXTO (informativo, no vota)<Help k="contexto" />
+                  {analysis.contexto.length > 0 && (
+                    <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
+                      <div style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginBottom: 10 }}>
+                        CONTEXTO (informativo, no vota)<Help k="contexto" />
+                      </div>
+                      {analysis.contexto.map((c, i) => (
+                        <div key={i} style={{
+                          display: "flex", alignItems: "center", padding: "6px 0",
+                          borderTop: i ? `1px solid ${C.border}` : "none",
+                        }}>
+                          <Dot d={c.d} />
+                          <span style={{ width: 90, color: C.dim, flexShrink: 0 }}>{c.n}</span>
+                          <span style={{ fontSize: 12 }}>{c.v}</span>
+                        </div>
+                      ))}
                     </div>
-                    {analysis.contexto.map((c, i) => (
-                      <div key={i} style={{
-                        display: "flex", alignItems: "center", padding: "6px 0",
-                        borderTop: i ? `1px solid ${C.border}` : "none",
-                      }}>
-                        <Dot d={c.d} />
-                        <span style={{ width: 90, color: C.dim, flexShrink: 0 }}>{c.n}</span>
-                        <span style={{ fontSize: 12 }}>{c.v}</span>
-                      </div>
-                    ))}
-                  </div>
+                  )}
                 </div>
               ) : (
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 14, marginBottom: 14 }}>

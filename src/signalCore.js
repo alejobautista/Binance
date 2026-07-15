@@ -185,6 +185,175 @@ export const last = (arr) => {
   return null;
 };
 
+/* ---------- INDICADORES DE LAS 5 ESTRATEGIAS ---------- */
+// ADX/DMI de Wilder: fuerza y direccion de la tendencia.
+export const adxDmi = (highs, lows, closes, period = 14) => {
+  const n = closes.length;
+  const plusDM = [0], minusDM = [0], tr = [0];
+  for (let i = 1; i < n; i++) {
+    const up = highs[i] - highs[i - 1], down = lows[i - 1] - lows[i];
+    plusDM.push(up > down && up > 0 ? up : 0);
+    minusDM.push(down > up && down > 0 ? down : 0);
+    tr.push(Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1])));
+  }
+  const smooth = (arr) => {
+    const out = new Array(n).fill(null);
+    if (n <= period) return out;
+    let s = 0;
+    for (let i = 1; i <= period; i++) s += arr[i];
+    out[period] = s;
+    for (let i = period + 1; i < n; i++) out[i] = out[i - 1] - out[i - 1] / period + arr[i];
+    return out;
+  };
+  const trS = smooth(tr), pS = smooth(plusDM), mS = smooth(minusDM);
+  const pDI = new Array(n).fill(null), mDI = new Array(n).fill(null), dx = new Array(n).fill(null);
+  for (let i = period; i < n; i++) {
+    if (!trS[i]) continue;
+    pDI[i] = (100 * pS[i]) / trS[i];
+    mDI[i] = (100 * mS[i]) / trS[i];
+    const s = pDI[i] + mDI[i];
+    dx[i] = s ? (100 * Math.abs(pDI[i] - mDI[i])) / s : 0;
+  }
+  const adxArr = new Array(n).fill(null);
+  const start = period * 2;
+  if (n > start) {
+    let s = 0;
+    for (let i = period; i < start; i++) s += dx[i] ?? 0;
+    adxArr[start - 1] = s / period;
+    for (let i = start; i < n; i++) adxArr[i] = (adxArr[i - 1] * (period - 1) + (dx[i] ?? 0)) / period;
+  }
+  return { adx: adxArr, plusDI: pDI, minusDI: mDI };
+};
+
+export const cci = (highs, lows, closes, period = 14) => {
+  const tp = closes.map((c, i) => (highs[i] + lows[i] + c) / 3);
+  const out = new Array(closes.length).fill(null);
+  for (let i = period - 1; i < tp.length; i++) {
+    let s = 0;
+    for (let j = i - period + 1; j <= i; j++) s += tp[j];
+    const m = s / period;
+    let md = 0;
+    for (let j = i - period + 1; j <= i; j++) md += Math.abs(tp[j] - m);
+    md /= period;
+    out[i] = md ? (tp[i] - m) / (0.015 * md) : 0;
+  }
+  return out;
+};
+
+// Canal de Donchian de las N velas ANTERIORES (sin incluir la actual): ruptura limpia.
+export const donchian = (highs, lows, period) => {
+  const n = highs.length;
+  const up = new Array(n).fill(null), lo = new Array(n).fill(null);
+  for (let i = period; i < n; i++) {
+    up[i] = Math.max(...highs.slice(i - period, i));
+    lo[i] = Math.min(...lows.slice(i - period, i));
+  }
+  return { up, lo };
+};
+
+export const supertrend = (highs, lows, closes, period = 10, mult = 3) => {
+  const a = atr(highs, lows, closes, period);
+  const n = closes.length;
+  const dir = new Array(n).fill(null), line = new Array(n).fill(null);
+  let ub = null, lb = null, prevDir = 1;
+  for (let i = 0; i < n; i++) {
+    if (a[i] == null) continue;
+    const mid = (highs[i] + lows[i]) / 2;
+    let bu = mid + mult * a[i], bl = mid - mult * a[i];
+    if (ub != null) {
+      bu = bu < ub || closes[i - 1] > ub ? bu : ub;
+      bl = bl > lb || closes[i - 1] < lb ? bl : lb;
+    }
+    let d = prevDir;
+    if (prevDir === 1 && closes[i] < bl) d = -1;
+    else if (prevDir === -1 && closes[i] > bu) d = 1;
+    dir[i] = d;
+    line[i] = d === 1 ? bl : bu;
+    ub = bu; lb = bl; prevDir = d;
+  }
+  return { dir, line };
+};
+
+export const psar = (highs, lows, step = 0.02, maxStep = 0.2) => {
+  const n = highs.length;
+  const out = new Array(n).fill(null);
+  if (n < 3) return out;
+  let up = true, af = step, ep = highs[0], sar = lows[0];
+  for (let i = 1; i < n; i++) {
+    sar = sar + af * (ep - sar);
+    if (up) {
+      sar = Math.min(sar, lows[i - 1], i > 1 ? lows[i - 2] : lows[i - 1]);
+      if (lows[i] < sar) { up = false; sar = ep; ep = lows[i]; af = step; }
+      else if (highs[i] > ep) { ep = highs[i]; af = Math.min(maxStep, af + step); }
+    } else {
+      sar = Math.max(sar, highs[i - 1], i > 1 ? highs[i - 2] : highs[i - 1]);
+      if (highs[i] > sar) { up = true; sar = ep; ep = highs[i]; af = step; }
+      else if (lows[i] < ep) { ep = lows[i]; af = Math.min(maxStep, af + step); }
+    }
+    out[i] = { sar, up };
+  }
+  return out;
+};
+
+export const ichimoku = (highs, lows, closes) => {
+  const n = closes.length;
+  const mid = (p, i) =>
+    i >= p - 1 ? (Math.max(...highs.slice(i - p + 1, i + 1)) + Math.min(...lows.slice(i - p + 1, i + 1))) / 2 : null;
+  const tenkan = [], kijun = [], spanA = [], spanB = [];
+  for (let i = 0; i < n; i++) {
+    tenkan.push(mid(9, i));
+    kijun.push(mid(26, i));
+  }
+  for (let i = 0; i < n; i++) {
+    spanA.push(tenkan[i] != null && kijun[i] != null ? (tenkan[i] + kijun[i]) / 2 : null);
+    spanB.push(mid(52, i));
+  }
+  return { tenkan, kijun, spanA, spanB }; // la nube ACTUAL en i son los spans calculados en i-26
+};
+
+export const cmf = (candles, period = 20) => {
+  const out = new Array(candles.length).fill(null);
+  for (let i = period - 1; i < candles.length; i++) {
+    let mfv = 0, vol = 0;
+    for (let j = i - period + 1; j <= i; j++) {
+      const c = candles[j];
+      const range = c.high - c.low;
+      const mult = range ? (c.close - c.low - (c.high - c.close)) / range : 0;
+      mfv += mult * c.volume;
+      vol += c.volume;
+    }
+    out[i] = vol ? mfv / vol : 0;
+  }
+  return out;
+};
+
+export const mfi = (highs, lows, closes, vols, period = 14) => {
+  const tp = closes.map((c, i) => (highs[i] + lows[i] + c) / 3);
+  const out = new Array(closes.length).fill(null);
+  for (let i = period; i < closes.length; i++) {
+    let pos = 0, neg = 0;
+    for (let j = i - period + 1; j <= i; j++) {
+      const mf = tp[j] * vols[j];
+      if (tp[j] > tp[j - 1]) pos += mf;
+      else if (tp[j] < tp[j - 1]) neg += mf;
+    }
+    out[i] = neg === 0 ? 100 : 100 - 100 / (1 + pos / neg);
+  }
+  return out;
+};
+
+export const anchoredVWAP = (candles, anchorIdx) => {
+  const out = new Array(candles.length).fill(null);
+  let pv = 0, v = 0;
+  for (let i = anchorIdx; i < candles.length; i++) {
+    const c = candles[i];
+    pv += ((c.high + c.low + c.close) / 3) * c.volume;
+    v += c.volume;
+    out[i] = v ? pv / v : null;
+  }
+  return out;
+};
+
 /* ---------- ANALISIS POR TIMEFRAME ---------- */
 export function analyzeTF(candles) {
   const closes = candles.map((c) => c.close);
@@ -616,7 +785,340 @@ export function buildStructureSignal(c15, tf15, c1h, tf1h, live, riskMode) {
   };
 }
 
+/* ---------- EMPAQUETADO COMUN (sobreextension + niveles + confianza) ---------- */
+function packageSignal({
+  modo, tipo, bias, dir, confidence, core, contexto = [], warnings = [],
+  blockedDir = null, invalidation = "", tf15, tf1h, live, stopPrice, riskMode, extra = {},
+}) {
+  const strict = riskMode !== "flexible";
+  const A = tf15.atr || live * 0.01;
+  const extATR = tf15.atr ? (live - tf15.ema21) / tf15.atr : 0;
+
+  if (dir === "long" && extATR > 3) {
+    const msg = `Sobreextendido: ${extATR.toFixed(1)} ATR sobre la EMA21. Perseguir aqui es entrar tarde; lo sano es esperar retroceso.`;
+    if (strict) { blockedDir = "long"; dir = null; confidence = "-"; invalidation = msg; }
+    else warnings.push(msg);
+  }
+  if (dir === "short" && extATR < -3) {
+    const msg = `Sobreextendido a la baja: ${Math.abs(extATR).toFixed(1)} ATR bajo la EMA21. Lo sano es esperar el rebote tecnico.`;
+    if (strict) { blockedDir = "short"; dir = null; confidence = "-"; invalidation = msg; }
+    else warnings.push(msg);
+  }
+
+  let levels = {};
+  if (dir && stopPrice != null) {
+    levels = buildLevels(dir, live, A, stopPrice, tf15, tf1h, strict);
+    if (levels.blocked) {
+      blockedDir = dir; dir = null; confidence = "-";
+      invalidation = levels.reason;
+      levels = { roomR: levels.roomR, ceiling: levels.ceiling };
+    } else if (levels.warning) {
+      warnings.push(levels.warning);
+    }
+  } else if (dir) {
+    dir = null; confidence = "-";
+    invalidation = invalidation || "No se pudo calcular un stop valido para este setup.";
+  }
+
+  if (dir && warnings.length) {
+    if (warnings.length >= 2) confidence = "BAJA";
+    else if (confidence === "ALTA") confidence = "MEDIA";
+  }
+
+  return {
+    modo, tipo, bias, signal: dir === "long" ? "LARGO" : dir === "short" ? "CORTO" : "SIN OPERAR",
+    dir, confidence: dir ? confidence : "-",
+    core, contexto, bull: 0, bear: 0, warnings, blockedDir, riskMode,
+    entry: levels.entry ?? null, zone: levels.zone ?? null, stop: levels.stop ?? null,
+    tps: levels.tps ?? [], roomR: levels.roomR ?? null, ceiling: levels.ceiling ?? null,
+    maxLev: levels.maxLev ?? null,
+    invalidation: dir ? levels.invalidation : invalidation,
+    atrVal: A, extATR, ...extra,
+  };
+}
+
+const emaBias = (tf1h, tf4h) => {
+  const tfScore = (t) =>
+    t.ema50 && t.ema200
+      ? t.close > t.ema50 && t.ema50 > t.ema200 ? 1
+        : t.close < t.ema50 && t.ema50 < t.ema200 ? -1 : 0
+      : 0;
+  const s = 2 * tfScore(tf4h) + tfScore(tf1h);
+  return s >= 2 ? "ALCISTA" : s <= -2 ? "BAJISTA" : "RANGO";
+};
+
+/* ---------- ESTRATEGIA 3: ICHIMOKU KINKO HYO (tendencia) ---------- */
+export function buildIchimokuSignal(c15, tf15, tf1h, tf4h, live, riskMode) {
+  const highs = c15.map((c) => c.high), lows = c15.map((c) => c.low), closes = c15.map((c) => c.close);
+  const n = closes.length;
+  const base = { modo: "ichimoku", tipo: "tendencia", bias: emaBias(tf1h, tf4h), tf15, tf1h, live, riskMode };
+  if (n < 80) {
+    return packageSignal({ ...base, dir: null, core: [], invalidation: "Historia insuficiente para Ichimoku (se requieren 78+ velas)." });
+  }
+  const I = ichimoku(highs, lows, closes);
+  const i = n - 1;
+  const cloudA = I.spanA[i - 26], cloudB = I.spanB[i - 26]; // nube ACTUAL
+  const core = [];
+  if (cloudA == null || cloudB == null || I.tenkan[i] == null || I.kijun[i] == null) {
+    return packageSignal({ ...base, dir: null, core, invalidation: "Ichimoku sin datos suficientes." });
+  }
+  const cloudTop = Math.max(cloudA, cloudB), cloudBot = Math.min(cloudA, cloudB);
+  const px = closes[i];
+  const aboveKumo = px > cloudTop, belowKumo = px < cloudBot;
+  const tkBull = I.tenkan[i] > I.kijun[i];
+  const chikouBull = px > closes[i - 26];
+  const futureBull = I.spanA[i] > I.spanB[i];
+
+  core.push({
+    n: "Kumo",
+    v: aboveKumo ? `Precio SOBRE la nube (${fmt(cloudBot)} - ${fmt(cloudTop)})`
+      : belowKumo ? `Precio BAJO la nube (${fmt(cloudBot)} - ${fmt(cloudTop)})`
+      : "Precio DENTRO de la nube - los cruces aqui se ignoran",
+    d: aboveKumo ? "up" : belowKumo ? "down" : "flat",
+  });
+  core.push({ n: "Tenkan/Kijun", v: tkBull ? `Cruce TK alcista (${fmt(I.tenkan[i])} > ${fmt(I.kijun[i])})` : `Cruce TK bajista (${fmt(I.tenkan[i])} < ${fmt(I.kijun[i])})`, d: tkBull ? "up" : "down" });
+  core.push({ n: "Chikou", v: chikouBull ? "Chikou sobre el precio de hace 26 velas" : "Chikou bajo el precio de hace 26 velas", d: chikouBull ? "up" : "down" });
+  core.push({ n: "Nube futura", v: futureBull ? "Alcista (Span A > Span B): viento a favor de largos" : "Bajista (Span A < Span B): viento a favor de cortos", d: futureBull ? "up" : "down" });
+
+  let dir = null, confidence = "-", invalidation = "", stopPrice = null;
+  if (aboveKumo && tkBull && chikouBull) {
+    dir = "long"; confidence = futureBull ? "ALTA" : "MEDIA";
+    stopPrice = Math.min(I.kijun[i], cloudBot) * 0.999; // stop en Kijun o lado opuesto de la nube
+  } else if (belowKumo && !tkBull && !chikouBull) {
+    dir = "short"; confidence = !futureBull ? "ALTA" : "MEDIA";
+    stopPrice = Math.max(I.kijun[i], cloudTop) * 1.001;
+  } else {
+    invalidation = "Sin triple confirmacion Ichimoku: se exige precio fuera del Kumo + cruce TK a favor + Chikou libre. Regla innegociable: dentro de la nube no se opera.";
+  }
+  return packageSignal({ ...base, dir, confidence, core, invalidation, stopPrice, extra: { ichimoku: { tenkan: I.tenkan[i], kijun: I.kijun[i], cloudTop, cloudBot } } });
+}
+
+/* ---------- ESTRATEGIA 4: KELTNER + CCI (reversion a la media) ---------- */
+export function buildKeltnerSignal(c15, tf15, tf1h, tf4h, live, riskMode) {
+  const strict = riskMode !== "flexible";
+  const highs = c15.map((c) => c.high), lows = c15.map((c) => c.low), closes = c15.map((c) => c.close);
+  const n = closes.length;
+  const base = { modo: "keltner", tipo: "reversion", bias: emaBias(tf1h, tf4h), tf15, tf1h, live, riskMode };
+  if (n < 70) return packageSignal({ ...base, dir: null, core: [], invalidation: "Historia insuficiente para Keltner 50." });
+
+  const mid = ema(closes, 50);
+  const a = atr(highs, lows, closes, 20);
+  const i = n - 1;
+  if (mid[i] == null || a[i] == null) return packageSignal({ ...base, dir: null, core: [], invalidation: "Keltner sin datos suficientes." });
+  const lo39 = mid[i] - 3.9 * a[i], up39 = mid[i] + 3.9 * a[i];
+  const lo27 = mid[i] - 2.7 * a[i], up27 = mid[i] + 2.7 * a[i];
+  const cciArr = cci(highs, lows, closes, 14);
+  const { adx } = adxDmi(highs, lows, closes, 14);
+  const adxNow = last(adx);
+  const core = [], warnings = [];
+
+  // ¿hubo extremo reciente? (ultimas 8 velas tocaron la banda 3.9)
+  let brokeLow = false, brokeHigh = false;
+  for (let j = Math.max(0, i - 8); j <= i; j++) {
+    if (mid[j] != null && a[j] != null) {
+      if (lows[j] < mid[j] - 3.9 * a[j]) brokeLow = true;
+      if (highs[j] > mid[j] + 3.9 * a[j]) brokeHigh = true;
+    }
+  }
+  const px = closes[i];
+  const reenterLong = brokeLow && px > lo27;
+  const reenterShort = brokeHigh && px < up27;
+  const cciUp = cciArr[i] != null && cciArr[i] > -40 && (cciArr[i - 1] ?? 0) <= -40;
+  const cciDown = cciArr[i] != null && cciArr[i] < 40 && (cciArr[i - 1] ?? 0) >= 40;
+
+  core.push({ n: "Banda 3.9", v: brokeLow ? "Extremo de sobreventa tocado (ultimas 8 velas)" : brokeHigh ? "Extremo de sobrecompra tocado (ultimas 8 velas)" : "Sin extremo reciente: no hay resorte que operar", d: brokeLow ? "up" : brokeHigh ? "down" : "flat" });
+  core.push({ n: "Re-entrada 2.7", v: reenterLong ? `Cierre de vuelta sobre ${fmt(lo27)}` : reenterShort ? `Cierre de vuelta bajo ${fmt(up27)}` : "Sin re-entrada confirmada al canal", d: reenterLong ? "up" : reenterShort ? "down" : "flat" });
+  core.push({ n: "CCI 14", v: cciArr[i] != null ? `${cciArr[i].toFixed(0)}${cciUp ? " - cruzo -40 al alza (gatillo largo)" : cciDown ? " - cruzo +40 a la baja (gatillo corto)" : " - sin cruce de gatillo"}` : "sin datos", d: cciUp ? "up" : cciDown ? "down" : "flat" });
+  core.push({ n: "ADX regimen", v: adxNow != null ? `${adxNow.toFixed(0)} - ${adxNow < 25 ? "rango/tendencia debil: apto para reversion" : "TENDENCIA FUERTE: la reversion es peligrosa"}` : "sin datos", d: adxNow != null && adxNow < 25 ? "up" : "down" });
+
+  let dir = null, confidence = "-", invalidation = "", blockedDir = null, stopPrice = null;
+  if (reenterLong && cciUp) { dir = "long"; stopPrice = lo39 * 0.999; }
+  else if (reenterShort && cciDown) { dir = "short"; stopPrice = up39 * 1.001; }
+  else invalidation = "Sin setup de reversion: se exige extremo en la banda 3.9 + re-entrada sobre/bajo la 2.7 + cruce del CCI en ±40.";
+
+  if (dir && adxNow != null && adxNow >= 30) {
+    const msg = `ADX en ${adxNow.toFixed(0)}: hay tendencia fuerte y comprar/vender contra ella (reversion) es ir contra un tren en marcha.`;
+    if (strict) { blockedDir = dir; dir = null; invalidation = msg; }
+    else warnings.push(msg);
+  }
+  if (dir) confidence = adxNow != null && adxNow < 20 ? "ALTA" : "MEDIA";
+  return packageSignal({ ...base, dir, confidence, core, warnings, blockedDir, invalidation, stopPrice });
+}
+
+/* ---------- ESTRATEGIA 5: DONCHIAN / TURTLE SYSTEM 2 + ADX (ruptura) ---------- */
+export function buildDonchianSignal(c15, tf15, tf1h, tf4h, live, riskMode) {
+  const strict = riskMode !== "flexible";
+  const highs = c15.map((c) => c.high), lows = c15.map((c) => c.low), closes = c15.map((c) => c.close);
+  const n = closes.length;
+  const base = { modo: "donchian", tipo: "ruptura", bias: emaBias(tf1h, tf4h), tf15, tf1h, live, riskMode };
+  if (n < 90) return packageSignal({ ...base, dir: null, core: [], invalidation: "Historia insuficiente para Donchian 55." });
+
+  const d55 = donchian(highs, lows, 55);
+  const d20 = donchian(highs, lows, 20);
+  const { adx, plusDI, minusDI } = adxDmi(highs, lows, closes, 14);
+  const i = n - 1;
+  const adxNow = adx[i], pdi = plusDI[i], mdi = minusDI[i];
+  const A = tf15.atr || live * 0.01;
+  const core = [], warnings = [];
+
+  const breakUp = d55.up[i] != null && closes[i] > d55.up[i];
+  const breakDown = d55.lo[i] != null && closes[i] < d55.lo[i];
+  const adxOk = adxNow != null && adxNow > 25;
+
+  core.push({ n: "Donchian 55", v: breakUp ? `CIERRE sobre el maximo de 55 velas (${fmt(d55.up[i])})` : breakDown ? `CIERRE bajo el minimo de 55 velas (${fmt(d55.lo[i])})` : `Dentro del canal ${fmt(d55.lo[i])} - ${fmt(d55.up[i])}: sin ruptura`, d: breakUp ? "up" : breakDown ? "down" : "flat" });
+  core.push({ n: "ADX 14", v: adxNow != null ? `${adxNow.toFixed(0)} - ${adxOk ? "tendencia real confirmada (>25)" : "sin tendencia suficiente (<25): ruptura sospechosa"}` : "sin datos", d: adxOk ? "up" : "flat" });
+  core.push({ n: "DMI", v: pdi != null ? `+DI ${pdi.toFixed(0)} vs -DI ${mdi.toFixed(0)} - ${pdi > mdi ? "dominan compradores" : "dominan vendedores"}` : "sin datos", d: pdi > mdi ? "up" : "down" });
+  core.push({ n: "Volumen", v: `${tf15.volRatio.toFixed(2)}x la media - ${tf15.volRatio > 1.5 ? "ruptura con conviccion" : "por debajo del 150% recomendado"}`, d: tf15.volRatio > 1.5 ? "up" : "flat" });
+
+  let dir = null, confidence = "-", invalidation = "", blockedDir = null, stopPrice = null;
+  if (breakUp) {
+    if (adxOk && pdi > mdi) { dir = "long"; stopPrice = live - 2 * A; } // stop Turtle: 2N
+    else {
+      const msg = "Ruptura alcista de 55 pero sin filtro: se exige ADX>25 y +DI>-DI para confirmar tendencia real.";
+      if (strict) { blockedDir = "long"; invalidation = msg; } else { dir = "long"; stopPrice = live - 2 * A; warnings.push(msg); }
+    }
+  } else if (breakDown) {
+    if (adxOk && mdi > pdi) { dir = "short"; stopPrice = live + 2 * A; }
+    else {
+      const msg = "Ruptura bajista de 55 pero sin filtro: se exige ADX>25 y -DI>+DI.";
+      if (strict) { blockedDir = "short"; invalidation = msg; } else { dir = "short"; stopPrice = live + 2 * A; warnings.push(msg); }
+    }
+  } else {
+    invalidation = "Sin ruptura del canal de 55 velas. El sistema Turtle espera la ruptura; no anticipa.";
+  }
+  if (dir && tf15.volRatio < 1.5) warnings.push("Volumen de ruptura por debajo del 150% de la media: desconfiar (regla Turtle moderna).");
+  if (dir) confidence = tf15.volRatio > 1.5 ? "ALTA" : "MEDIA";
+  const trailing = dir === "long" ? d20.lo[i] : d20.up[i];
+  return packageSignal({
+    ...base, dir, confidence, core, warnings, blockedDir, invalidation, stopPrice,
+    extra: { turtleTrail: trailing != null ? { nivel: trailing, texto: dir === "long" ? "salida Turtle: nuevo minimo de 20 velas" : "salida Turtle: nuevo maximo de 20 velas" } : null },
+  });
+}
+
+/* ---------- ESTRATEGIA 6: SUPERTREND + ADX/DMI + PARABOLIC SAR (confluencia) ---------- */
+export function buildSupertrendSignal(c15, tf15, tf1h, tf4h, live, riskMode) {
+  const strict = riskMode !== "flexible";
+  const highs = c15.map((c) => c.high), lows = c15.map((c) => c.low), closes = c15.map((c) => c.close);
+  const n = closes.length;
+  const base = { modo: "supertrend", tipo: "confluencia", bias: emaBias(tf1h, tf4h), tf15, tf1h, live, riskMode };
+  if (n < 60) return packageSignal({ ...base, dir: null, core: [], invalidation: "Historia insuficiente para SuperTrend." });
+
+  const st = supertrend(highs, lows, closes, 10, 3);
+  const { adx, plusDI, minusDI } = adxDmi(highs, lows, closes, 14);
+  const sar = psar(highs, lows, 0.02, 0.2);
+  const i = n - 1;
+  const stDir = st.dir[i], stLine = st.line[i];
+  const adxNow = adx[i], pdi = plusDI[i], mdi = minusDI[i];
+  const sarNow = sar[i];
+  const core = [], warnings = [];
+
+  let flipAge = null;
+  for (let j = i; j > 0 && j > i - 40; j--) {
+    if (st.dir[j] !== st.dir[j - 1]) { flipAge = i - j; break; }
+  }
+  const adxOk = adxNow != null && adxNow > 25;
+  const sarBull = sarNow ? sarNow.up : null;
+
+  core.push({ n: "SuperTrend", v: stDir === 1 ? `VERDE - linea en ${fmt(stLine)} bajo el precio${flipAge != null ? ` (viro hace ${flipAge} velas)` : ""}` : `ROJO - linea en ${fmt(stLine)} sobre el precio${flipAge != null ? ` (viro hace ${flipAge} velas)` : ""}`, d: stDir === 1 ? "up" : "down" });
+  core.push({ n: "ADX 14", v: adxNow != null ? `${adxNow.toFixed(0)} - ${adxOk ? "tendencia con fuerza (>25)" : adxNow < 20 ? "SIN tendencia (<20): sistema apagado" : "fuerza dudosa (20-25)"}` : "sin datos", d: adxOk ? "up" : "flat" });
+  core.push({ n: "DMI", v: pdi != null ? `+DI ${pdi.toFixed(0)} vs -DI ${mdi.toFixed(0)}` : "sin datos", d: pdi > mdi ? "up" : "down" });
+  core.push({ n: "Parabolic SAR", v: sarBull == null ? "sin datos" : sarBull ? `Puntos BAJO el precio (${fmt(sarNow.sar)}) - a favor de largos` : `Puntos SOBRE el precio (${fmt(sarNow.sar)}) - a favor de cortos`, d: sarBull == null ? "flat" : sarBull ? "up" : "down" });
+
+  let dir = null, confidence = "-", invalidation = "", blockedDir = null, stopPrice = null;
+  if (adxNow != null && adxNow < 20) {
+    invalidation = `ADX en ${adxNow.toFixed(0)} (<20): regla de oro del sistema - sin tendencia, se apaga y se espera.`;
+  } else if (stDir === 1 && adxOk && pdi > mdi) {
+    dir = "long"; stopPrice = Math.min(stLine, sarBull ? sarNow.sar : stLine) * 0.999;
+  } else if (stDir === -1 && adxOk && mdi > pdi) {
+    dir = "short"; stopPrice = Math.max(stLine, sarBull === false ? sarNow.sar : stLine) * 1.001;
+  } else {
+    invalidation = "Sin confluencia completa: se exige SuperTrend + ADX>25 + DMI apuntando en la misma direccion.";
+  }
+  if (dir) {
+    const sarAgrees = dir === "long" ? sarBull === true : sarBull === false;
+    confidence = sarAgrees ? "ALTA" : "MEDIA";
+    if (!sarAgrees) warnings.push("El Parabolic SAR aun no acompana: confluencia incompleta, senal de menor calidad.");
+    if (flipAge != null && flipAge > 12) warnings.push(`El SuperTrend viro hace ${flipAge} velas: tendencia madura, parte del movimiento ya paso.`);
+  }
+  return packageSignal({ ...base, dir, confidence, core, warnings, blockedDir, invalidation, stopPrice });
+}
+
+/* ---------- ESTRATEGIA 7: ANCHORED VWAP + CMF + MFI (flujo de dinero) ---------- */
+export function buildAvwapSignal(c15, tf15, tf1h, tf4h, live, riskMode) {
+  const highs = c15.map((c) => c.high), lows = c15.map((c) => c.low), closes = c15.map((c) => c.close);
+  const vols = c15.map((c) => c.volume);
+  const n = closes.length;
+  const base = { modo: "avwap", tipo: "flujo", bias: emaBias(tf1h, tf4h), tf15, tf1h, live, riskMode };
+  if (n < 110) return packageSignal({ ...base, dir: null, core: [], invalidation: "Historia insuficiente para AVWAP." });
+
+  const look = 96;
+  let loIdx = n - look, hiIdx = n - look;
+  for (let j = n - look; j < n; j++) {
+    if (lows[j] < lows[loIdx]) loIdx = j;
+    if (highs[j] > highs[hiIdx]) hiIdx = j;
+  }
+  const avLow = anchoredVWAP(c15, loIdx);   // ancla en el minimo del swing (para largos)
+  const avHigh = anchoredVWAP(c15, hiIdx);  // ancla en el maximo del swing (para cortos)
+  const i = n - 1;
+  const cmfArr = cmf(c15, 20);
+  const mfiArr = mfi(highs, lows, closes, vols, 14);
+  const cmfNow = cmfArr[i], mfiNow = mfiArr[i];
+  const A = tf15.atr || live * 0.01;
+  const core = [], warnings = [];
+
+  const avL = avLow[i], avH = avHigh[i];
+  const avLRising = avL != null && avLow[i - 8] != null && avL > avLow[i - 8];
+  const avHFalling = avH != null && avHigh[i - 8] != null && avH < avHigh[i - 8];
+  const px = closes[i];
+
+  core.push({ n: "AVWAP (min)", v: avL != null ? `${fmt(avL)} anclado al minimo del swing - ${px > avL ? "compradores en control desde alli" : "precio por debajo: compradores perdiendo"}${avLRising ? ", ascendente" : ""}` : "sin datos", d: avL != null && px > avL ? "up" : "down" });
+  core.push({ n: "AVWAP (max)", v: avH != null ? `${fmt(avH)} anclado al maximo del swing - ${px < avH ? "vendedores en control desde alli" : "precio por encima: vendedores perdiendo"}${avHFalling ? ", descendente" : ""}` : "sin datos", d: avH != null && px < avH ? "down" : "up" });
+  core.push({ n: "CMF 20", v: cmfNow != null ? `${cmfNow.toFixed(3)} - ${cmfNow > 0.05 ? "acumulacion institucional (> +0.05)" : cmfNow < -0.05 ? "distribucion institucional (< -0.05)" : "zona neutra ±0.05, sin conviccion"}` : "sin datos", d: cmfNow > 0.05 ? "up" : cmfNow < -0.05 ? "down" : "flat" });
+  core.push({ n: "MFI 14", v: mfiNow != null ? `${mfiNow.toFixed(0)} - ${mfiNow > 80 ? "sobrecompra de flujo" : mfiNow < 20 ? "sobreventa de flujo" : "zona media"}` : "sin datos", d: mfiNow > 80 ? "down" : mfiNow < 20 ? "up" : "flat" });
+
+  let dir = null, confidence = "-", invalidation = "", stopPrice = null;
+  const distL = avL != null ? (px - avL) / A : null;
+  if (avL != null && px > avL && cmfNow != null && cmfNow > 0.05 && (mfiNow == null || mfiNow < 80)) {
+    dir = "long";
+    stopPrice = Math.min(avL - 0.6 * A, px - 0.8 * A); // bajo el AVWAP (aprox. regla de 2 cierres en contra)
+    confidence = avLRising && cmfNow > 0.1 ? "ALTA" : "MEDIA";
+    if (distL != null && distL > 2.5) warnings.push(`El precio esta ${distL.toFixed(1)} ATR sobre el AVWAP: Shannon compra el retroceso, no la extension.`);
+  } else if (avH != null && px < avH && cmfNow != null && cmfNow < -0.05 && (mfiNow == null || mfiNow > 20)) {
+    dir = "short";
+    stopPrice = Math.max(avH + 0.6 * A, px + 0.8 * A);
+    confidence = avHFalling && cmfNow < -0.1 ? "ALTA" : "MEDIA";
+    const distH = (avH - px) / A;
+    if (distH > 2.5) warnings.push(`El precio esta ${distH.toFixed(1)} ATR bajo el AVWAP: mejor esperar el rebote hacia el ancla.`);
+  } else {
+    invalidation = "Sin alineacion de flujo: se exige precio del lado correcto del AVWAP anclado al swing + CMF fuera de la zona neutra (±0.05) + MFI sin extremo en contra.";
+  }
+  return packageSignal({ ...base, dir, confidence, core, warnings, invalidation, stopPrice, extra: { avwap: { low: avL, high: avH } } });
+}
+
 /* ---------- EVALUACION UNIFICADA ---------- */
+export const STRATEGIES = [
+  ["indicadores", "INDICADORES"],
+  ["estructura", "ESTRUCTURA"],
+  ["ichimoku", "ICHIMOKU"],
+  ["keltner", "KELTNER+CCI"],
+  ["donchian", "DONCHIAN 55"],
+  ["supertrend", "SUPERTREND"],
+  ["avwap", "AVWAP FLUJO"],
+];
+export const STRATEGY_KEYS = STRATEGIES.map(([k]) => k);
+
+function buildFor(strategy, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode) {
+  switch (strategy) {
+    case "estructura": return buildStructureSignal(c15c, t15, c1hc, t1h, live, riskMode);
+    case "ichimoku": return buildIchimokuSignal(c15c, t15, t1h, t4h, live, riskMode);
+    case "keltner": return buildKeltnerSignal(c15c, t15, t1h, t4h, live, riskMode);
+    case "donchian": return buildDonchianSignal(c15c, t15, t1h, t4h, live, riskMode);
+    case "supertrend": return buildSupertrendSignal(c15c, t15, t1h, t4h, live, riskMode);
+    case "avwap": return buildAvwapSignal(c15c, t15, t1h, t4h, live, riskMode);
+    default: return buildIndicatorSignal(t15, t1h, t4h, live, ind, riskMode);
+  }
+}
+
 // Corre la estrategia activa sobre velas ya descargadas. `c15/c1h/c4h` incluyen
 // la vela en formacion; se analiza sobre velas cerradas y `live` es el ultimo precio.
 export function evaluate(c15, c1h, c4h, live, strategy, ind, riskMode) {
@@ -625,18 +1127,36 @@ export function evaluate(c15, c1h, c4h, live, strategy, ind, riskMode) {
   const t15 = analyzeTF(c15c);
   const t1h = analyzeTF(c1hc);
   const t4h = analyzeTF(closed(c4h));
-  const sig = strategy === "estructura"
-    ? buildStructureSignal(c15c, t15, c1hc, t1h, live, riskMode)
-    : buildIndicatorSignal(t15, t1h, t4h, live, ind, riskMode);
+  const sig = buildFor(strategy, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode);
   return { tf15: t15, tf1h: t1h, tf4h: t4h, ...sig };
+}
+
+// Corre TODAS las estrategias sobre las mismas velas (los analisis TF se computan una sola vez).
+export function evaluateAll(c15, c1h, c4h, live, ind, riskMode) {
+  const closed = (arr) => arr.slice(0, -1);
+  const c15c = closed(c15), c1hc = closed(c1h);
+  const t15 = analyzeTF(c15c);
+  const t1h = analyzeTF(c1hc);
+  const t4h = analyzeTF(closed(c4h));
+  return STRATEGY_KEYS.map((k) => {
+    try {
+      return { strategy: k, sig: { tf15: t15, tf1h: t1h, tf4h: t4h, ...buildFor(k, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode) } };
+    } catch {
+      return { strategy: k, sig: null };
+    }
+  }).filter((r) => r.sig);
 }
 
 /* ---------- FEATURES PARA EL MOTOR DE PROBABILIDAD ---------- */
 export const SUBCAT_KEYS = ["memes", "defi", "l1", "l2", "ia", "gaming", "exchange", "otras"];
 
+// Estrategias one-hot ("indicadores" es la base implicita: todas en 0).
+const STRAT_FEATURES = ["estructura", "ichimoku", "keltner", "donchian", "supertrend", "avwap"];
+
 export const FEATURE_NAMES = [
   "sesgo", // bias
-  "estrategia:estructura", "dir:corto",
+  ...STRAT_FEATURES.map((k) => `estrategia:${k}`),
+  "dir:corto",
   "conf:alta", "conf:baja",
   "rsi", "volumen", "extension",
   "evento:bos", "evento:choch",
@@ -652,7 +1172,7 @@ export function extractFeatures(sig, subcat, ts) {
     (sig.dir === "long" && sig.bias === "ALCISTA") || (sig.dir === "short" && sig.bias === "BAJISTA") ? 1
       : (sig.dir === "long" && sig.bias === "BAJISTA") || (sig.dir === "short" && sig.bias === "ALCISTA") ? -1 : 0;
   x.push(biasAligned);
-  x.push(sig.modo === "estructura" ? 1 : 0);
+  for (const k of STRAT_FEATURES) x.push(sig.modo === k ? 1 : 0);
   x.push(sig.dir === "short" ? 1 : 0);
   x.push(sig.confidence === "ALTA" ? 1 : 0);
   x.push(sig.confidence === "BAJA" ? 1 : 0);
