@@ -579,8 +579,50 @@ export default function BinanceCopiloto() {
   const recordRows = useMemo(() => {
     const live = getSignals().map((s) => ({ ...s }));
     const bt = getBtSample();
-    return [...live, ...bt].sort((a, b) => b.ts - a.ts).slice(0, 120);
+    return [...live, ...bt].sort((a, b) => b.ts - a.ts);
   }, [trackerTick, tab]);
+
+  // Filtros del Record: estrategia / direccion / resultado
+  const [fModo, setFModo] = useState("todas");
+  const [fDir, setFDir] = useState("todas");
+  const [fOut, setFOut] = useState("todos");
+  const filteredRows = useMemo(() => recordRows.filter((s) =>
+    (fModo === "todas" || s.modo === fModo) &&
+    (fDir === "todas" || s.dir === fDir) &&
+    (fOut === "todos" ||
+      (fOut === "ganadas" && s.outcome !== "open" && (s.r ?? 0) > 0) ||
+      (fOut === "perdidas" && s.outcome !== "open" && (s.r ?? 0) <= 0) ||
+      (fOut === "abiertas" && s.outcome === "open"))
+  ), [recordRows, fModo, fDir, fOut]);
+  const filterSummary = useMemo(() => {
+    const closed = filteredRows.filter((s) => s.outcome !== "open" && s.r != null);
+    if (!closed.length) return null;
+    const wins = closed.filter((s) => s.r > 0).length;
+    return {
+      n: closed.length, wins,
+      winRate: wins / closed.length,
+      avgR: closed.reduce((a, s) => a + s.r, 0) / closed.length,
+    };
+  }, [filteredRows]);
+
+  // Ranking de estrategias por ratio de exito (win rate de TODOS los buckets +
+  // R medio de la muestra guardada).
+  const ranking = useMemo(() => {
+    const find = (key) => recStats.rows.find((r) => r.key === key);
+    const sample = recordRows.filter((s) => s.outcome !== "open" && s.r != null);
+    return STRATEGIES.map(([k]) => {
+      const g = find(`estrategia:${k}`);
+      const l = find(`estrategia:${k}|dir:largo`);
+      const c = find(`estrategia:${k}|dir:corto`);
+      const rs = sample.filter((s) => s.modo === k);
+      return {
+        k, n: g?.n ?? 0, win: g?.winRate ?? null,
+        winL: l?.winRate ?? null, nL: l?.n ?? 0,
+        winC: c?.winRate ?? null, nC: c?.n ?? 0,
+        avgR: rs.length ? rs.reduce((a, s) => a + s.r, 0) / rs.length : null, nR: rs.length,
+      };
+    }).filter((r) => r.n > 0).sort((a, b) => (b.win ?? 0) - (a.win ?? 0));
+  }, [recStats, recordRows]);
 
   // Posiciones vivas: senales marcadas "la tome" que siguen abiertas.
   const openTaken = useMemo(
@@ -1871,6 +1913,54 @@ export default function BinanceCopiloto() {
             </>
           )}
 
+          {ranking.length > 0 && (
+            <>
+              <div style={{ color: C.amber, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
+                RANKING DE ESTRATEGIAS - ¿cual tiene mejor ratio de exito?
+              </div>
+              <div style={{ background: C.panel, border: `1px solid ${C.amber}`, borderRadius: 4, overflow: "auto", marginBottom: 16 }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ background: C.panel2 }}>
+                      {["#", "ESTRATEGIA", "SEÑALES", "WIN RATE", "LARGOS", "CORTOS", "R MEDIO*"].map((h) => (
+                        <th key={h} style={{ padding: "8px 12px", textAlign: "left", color: C.dim, fontSize: 10, fontWeight: 500 }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ranking.map((r, i) => (
+                      <tr key={r.k} style={{ borderTop: `1px solid ${C.border}`, background: i === 0 && r.n >= 20 ? "#1a2410" : "transparent" }}>
+                        <td style={{ padding: "7px 12px", color: C.dim }}>{i + 1}</td>
+                        <td style={{ padding: "7px 12px", color: C.amber, textTransform: "uppercase", fontWeight: i === 0 ? 700 : 400 }}>
+                          {r.k}{i === 0 && r.n >= 20 ? " ★" : ""}
+                        </td>
+                        <td style={{ padding: "7px 12px", color: C.dim }}>{r.n}{r.n < 20 ? " (pocas)" : ""}</td>
+                        <td style={{ padding: "7px 12px", color: r.win >= 0.5 ? C.green : C.red, fontWeight: 700 }}>
+                          {(r.win * 100).toFixed(1)}%
+                        </td>
+                        <td style={{ padding: "7px 12px", color: r.winL == null ? C.dim : r.winL >= 0.5 ? C.green : C.red }}>
+                          {r.winL != null ? `${(r.winL * 100).toFixed(0)}% (${r.nL})` : "-"}
+                        </td>
+                        <td style={{ padding: "7px 12px", color: r.winC == null ? C.dim : r.winC >= 0.5 ? C.green : C.red }}>
+                          {r.winC != null ? `${(r.winC * 100).toFixed(0)}% (${r.nC})` : "-"}
+                        </td>
+                        <td style={{ padding: "7px 12px", color: r.avgR == null ? C.dim : r.avgR >= 0 ? C.green : C.red }}>
+                          {r.avgR != null ? `${r.avgR >= 0 ? "+" : ""}${r.avgR.toFixed(3)} (n=${r.nR})` : "-"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div style={{ padding: "8px 12px", fontSize: 10, color: C.dim, lineHeight: 1.5 }}>
+                  Win rate sobre TODAS las senales resueltas (backtest + vivo). *R medio calculado sobre la
+                  muestra guardada ({recordRows.filter((s) => s.r != null).length} filas), no sobre el total:
+                  usalo como referencia, no como cifra exacta. Con menos de 20 senales el ranking no es confiable.
+                  Recuerda que el win rate solo no basta: Donchian puede ganar con 40% si sus aciertos son grandes.
+                </div>
+              </div>
+            </>
+          )}
+
           {recStats.rows.length > 0 && (
             <>
               <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
@@ -1901,13 +1991,49 @@ export default function BinanceCopiloto() {
             </>
           )}
 
-          <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
+          <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 8 }}>
             SENALES RECIENTES (en vivo + muestra del backtest)
           </div>
-          {recordRows.length === 0 ? (
+          <div style={{
+            display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap", alignItems: "center",
+            background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "8px 10px",
+          }}>
+            <span style={{ color: C.dim, fontSize: 10 }}>ESTRATEGIA:</span>
+            <button onClick={() => setFModo("todas")} style={chipS(fModo === "todas", "amber")}>TODAS</button>
+            {STRATEGIES.map(([k]) => (
+              <button key={k} onClick={() => setFModo(k)} style={chipS(fModo === k, "amber")}>{k.toUpperCase()}</button>
+            ))}
+          </div>
+          <div style={{
+            display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap", alignItems: "center",
+            background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "8px 10px",
+          }}>
+            <span style={{ color: C.dim, fontSize: 10 }}>DIRECCION:</span>
+            {[["todas", "TODAS"], ["long", "LARGOS"], ["short", "CORTOS"]].map(([k, l]) => (
+              <button key={k} onClick={() => setFDir(k)} style={chipS(fDir === k, "green")}>{l}</button>
+            ))}
+            <span style={{ color: C.dim, fontSize: 10, marginLeft: 8 }}>RESULTADO:</span>
+            {[["todos", "TODOS"], ["ganadas", "GANADAS"], ["perdidas", "PERDIDAS"], ["abiertas", "ABIERTAS"]].map(([k, l]) => (
+              <button key={k} onClick={() => setFOut(k)} style={chipS(fOut === k, "green")}>{l}</button>
+            ))}
+          </div>
+          {filterSummary && (fModo !== "todas" || fDir !== "todas" || fOut !== "todos") && (
+            <div style={{ color: C.text, fontSize: 12, marginBottom: 8 }}>
+              Filtro actual: {filterSummary.n} resueltas ·{" "}
+              <span style={{ color: filterSummary.winRate >= 0.5 ? C.green : C.red, fontWeight: 700 }}>
+                {(filterSummary.winRate * 100).toFixed(1)}% ganadas
+              </span>{" "}· R medio{" "}
+              <span style={{ color: filterSummary.avgR >= 0 ? C.green : C.red, fontWeight: 700 }}>
+                {filterSummary.avgR >= 0 ? "+" : ""}{filterSummary.avgR.toFixed(3)}
+              </span>
+              <span style={{ color: C.dim, fontSize: 10 }}> (sobre la muestra listada)</span>
+            </div>
+          )}
+          {filteredRows.length === 0 ? (
             <div style={{ color: C.dim, padding: 30, textAlign: "center", border: `1px dashed ${C.border}`, borderRadius: 4, fontSize: 12, lineHeight: 1.6 }}>
-              Aun no hay senales registradas. Cada senal LARGO/CORTO que la app genere en Analisis
-              se guarda sola, y el backtest siembra el historico de 90 dias.
+              {recordRows.length === 0
+                ? "Aun no hay senales registradas. Cada senal LARGO/CORTO que la app genere se guarda sola, y el backtest siembra el historico."
+                : "Ninguna senal coincide con este filtro."}
             </div>
           ) : (
             <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, overflow: "auto", maxHeight: 420 }}>
@@ -1920,7 +2046,7 @@ export default function BinanceCopiloto() {
                   </tr>
                 </thead>
                 <tbody>
-                  {recordRows.map((s, i) => (
+                  {filteredRows.slice(0, 150).map((s, i) => (
                     <tr key={s.id ?? `bt-${i}`} style={{ borderTop: `1px solid ${C.border}` }}>
                       <td style={{ padding: "7px 12px", color: C.dim, whiteSpace: "nowrap" }}>
                         {new Date(s.ts).toLocaleString("es-CO", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
