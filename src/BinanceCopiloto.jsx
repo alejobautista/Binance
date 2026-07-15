@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { fetchJson, fetchCandles, fetchDepth, analyzeDepth, fmt, fmtQ, evaluate, evaluateAll, analyzeTF, STRATEGIES } from "./signalCore.js";
+import { fetchJson, fetchCandles, fetchDepth, analyzeDepth, fmt, fmtQ, evaluate, evaluateAll, analyzeTF, STRATEGIES, HORIZONS, HORIZON_KEYS } from "./signalCore.js";
 import { STABLES, assetCat, CAT_LABELS, SUBCAT_LABELS, subCat } from "./categories.js";
 import {
-  recordSignal, markTaken, getSignals, probability, resolveOpenSignals,
+  recordSignal, markTaken, saveMyOp, getSignals, probability, resolveOpenSignals,
   stats as trackerStats, runBacktest, exportJSON, importJSON, clearAll, getBtSample,
 } from "./tracker.js";
 import { CandleChart, EquityCurve } from "./Chart.jsx";
@@ -68,7 +68,13 @@ const Lectura = ({ children }) => (
   </div>
 );
 
-function lecturaTF(a) {
+const HORIZON_DESC = {
+  rapido: "gatillo en vela CERRADA de 5m; direccion validada en 15m y 1h. Horizonte tipico: 30 minutos a 6 horas; expira a las ~16h. Mas senales pero mas ruido: usa tamanos menores.",
+  intradia: "gatillo en vela CERRADA de 15m; direccion validada en 1h y 4h (y BTC en la META). Horizonte tipico: 2 a 24 horas; expira a las 48h.",
+  swing: "gatillo en vela CERRADA de 1h; direccion validada en 4h y 1 dia. Horizonte tipico: 1 a 8 dias - las operaciones se demoran DIAS, los stops son mas anchos y el apalancamiento seguro baja.",
+};
+
+function lecturaTF(a, H) {
   const reg = (t, lbl) => {
     const dir = t.ema50 && t.ema200
       ? t.close > t.ema50 && t.ema50 > t.ema200 ? "ALCISTA"
@@ -77,7 +83,7 @@ function lecturaTF(a) {
     const rsi = t.rsi != null ? ` (RSI ${t.rsi.toFixed(0)}: ${t.rsi > 55 ? "compradores" : t.rsi < 45 ? "vendedores" : "neutro"})` : "";
     return `${lbl} ${dir}${rsi}`;
   };
-  const partes = `${reg(a.tf4h, "4h")} · ${reg(a.tf1h, "1h")} · ${reg(a.tf15, "15m")}`;
+  const partes = `${reg(a.tf4h, H.mayor)} · ${reg(a.tf1h, H.medio)} · ${reg(a.tf15, H.gatillo)}`;
   const concl = a.bias === "ALCISTA"
     ? "Las temporalidades mayores RESPALDAN los largos; operar cortos aqui es ir contra la corriente (el motor los veta en estricto y la META exige mas llaves)."
     : a.bias === "BAJISTA"
@@ -162,6 +168,8 @@ export default function BinanceCopiloto() {
   const [riskMode, setRiskMode] = useState("estricto");
   const [cat, setCat] = useState("todos");
   const [subcat, setSubcat] = useState("todas");
+  const [horizon, setHorizon] = useState("intradia");
+  const H = HORIZONS[horizon];
 
   // Top 3 con motor real
   const [top3Sig, setTop3Sig] = useState([]);
@@ -223,15 +231,16 @@ export default function BinanceCopiloto() {
 
   const getCandlesCached = useCallback(async (sym) => {
     const now = Date.now();
-    const hit = candleCache.current.get(sym);
+    const key = `${sym}|${H.key}`;
+    const hit = candleCache.current.get(key);
     if (hit && now - hit.ts < 5 * 60 * 1000) return hit.data;
     const [c15, c1h, c4h] = await Promise.all([
-      fetchCandles(sym, "15m"), fetchCandles(sym, "1h"), fetchCandles(sym, "4h"),
+      fetchCandles(sym, H.gatillo), fetchCandles(sym, H.medio), fetchCandles(sym, H.mayor),
     ]);
     const data = { c15, c1h, c4h };
-    candleCache.current.set(sym, { ts: now, data });
+    candleCache.current.set(key, { ts: now, data });
     return data;
-  }, []);
+  }, [H]);
 
   // Corre TODAS las estrategias sobre los candidatos del filtro. Cada senal se
   // registra en el Record (con dedupe) para verificarse aunque no se ejecute.
@@ -258,7 +267,7 @@ export default function BinanceCopiloto() {
         const settled = await Promise.allSettled(batch.map(async (t) => {
           const { c15, c1h, c4h } = await getCandlesCached(t.symbol);
           const live = c15[c15.length - 1].close;
-          const opts = { btcBias: scanBtcBias, probFn: (s) => probability(s, t.symbol) };
+          const opts = { btcBias: scanBtcBias, probFn: (s) => probability(s, t.symbol), tfLabel: H.gatillo };
           const rows = [];
           for (const { strategy: st, sig } of evaluateAll(c15, c1h, c4h, live, ind, riskMode, opts)) {
             if (!sig.dir) continue;
@@ -304,18 +313,20 @@ export default function BinanceCopiloto() {
     return () => clearTimeout(t);
   }, [computeTop3, tab]);
 
-  const analyze = async (sym) => {
+  const analyze = async (sym, hz = horizon) => {
     setAnalyzing(true); setErr(null);
     try {
+      const HZ = HORIZONS[hz];
       const s = sym.toUpperCase().replace(/[/_]/g, "");
       const [c15, c1h, c4h, cBtc, depth] = await Promise.all([
-        fetchCandles(s, "15m"), fetchCandles(s, "1h"), fetchCandles(s, "4h"),
+        fetchCandles(s, HZ.gatillo), fetchCandles(s, HZ.medio), fetchCandles(s, HZ.mayor),
         fetchCandles("BTCUSDT", "4h", 250),
         fetchDepth(s).catch(() => null), // el libro es opcional: si falla, se analiza sin el
       ]);
       setMarket({
         symbol: s, time: new Date(), live: c15[c15.length - 1].close,
         c15, c1h, c4h, cBtc, depth, depthTime: depth ? new Date() : null,
+        H: HZ,
       });
       setTab("analyze");
     } catch (e) {
@@ -324,28 +335,42 @@ export default function BinanceCopiloto() {
     setAnalyzing(false);
   };
 
+  const changeHorizon = (k) => {
+    setHorizon(k);
+    if (market) analyze(market.symbol, k); // re-descarga velas del nuevo horizonte
+  };
+
   // Grafico EN VIVO: cada 20s se traen las ultimas velas de 15m y se funden con las
   // existentes (la vela en formacion se actualiza; al cerrar, la senal se recalcula sola).
   const [liveMode, setLiveMode] = useState(true);
   useEffect(() => {
     if (tab !== "analyze" || !market?.symbol || !liveMode) return;
     const sym = market.symbol;
+    const HZ = market.H ?? HORIZONS.intradia;
+    const merge = (arr, fresh) => {
+      const out = [...arr];
+      for (const nc of fresh) {
+        const idx = out.findIndex((c) => c.time === nc.time);
+        if (idx >= 0) out[idx] = nc;
+        else if (nc.time > out[out.length - 1].time) out.push(nc);
+      }
+      return out;
+    };
     const id = setInterval(async () => {
       if (typeof document !== "undefined" && document.hidden) return;
       try {
-        const fresh = await fetchCandles(sym, "15m", 3);
+        // gatillo siempre; la temporalidad media tambien se refresca para que el sesgo no envejezca
+        const [fG, fM] = await Promise.all([
+          fetchCandles(sym, HZ.gatillo, 3),
+          fetchCandles(sym, HZ.medio, 2),
+        ]);
         setMarket((m) => {
           if (!m || m.symbol !== sym) return m;
-          const c15 = [...m.c15];
-          for (const nc of fresh) {
-            const idx = c15.findIndex((c) => c.time === nc.time);
-            if (idx >= 0) c15[idx] = nc;
-            else if (nc.time > c15[c15.length - 1].time) c15.push(nc);
-          }
-          return { ...m, c15, live: c15[c15.length - 1].close, time: new Date() };
+          const c15 = merge(m.c15, fG);
+          return { ...m, c15, c1h: merge(m.c1h, fM), live: c15[c15.length - 1].close, time: new Date() };
         });
       } catch { /* sin red esta vez; se reintenta */ }
-    }, 20000);
+    }, HZ.pollMs);
     return () => clearInterval(id);
   }, [tab, market?.symbol, liveMode]);
 
@@ -373,10 +398,15 @@ export default function BinanceCopiloto() {
   // La senal se recalcula al instante al cambiar estrategia/indicadores/filtro.
   const analysis = useMemo(() => {
     if (!market) return null;
-    const opts = { btcBias: btcBiasNum, probFn: (s) => probability(s, market.symbol) };
+    const opts = {
+      btcBias: btcBiasNum,
+      probFn: (s) => probability(s, market.symbol),
+      tfLabel: (market.H ?? HORIZONS.intradia).gatillo,
+    };
     const sig = evaluate(market.c15, market.c1h, market.c4h, market.live, strategy, ind, riskMode, opts);
     return { symbol: market.symbol, time: market.time, live: market.live, ...sig };
   }, [market, strategy, ind, riskMode, btcBiasNum]);
+  const HA = market?.H ?? H; // horizonte del analisis en pantalla
 
   const prob = useMemo(
     () => (analysis?.dir && market ? probability(analysis, market.symbol, market.time.getTime()) : null),
@@ -390,7 +420,7 @@ export default function BinanceCopiloto() {
     const mine = [...getSignals()].reverse().find(
       (s) => s.symbol === market.symbol && s.dir === analysis.dir && s.modo === analysis.modo
     );
-    setLastRec(mine ? { id: mine.id, taken: mine.taken } : null);
+    setLastRec(mine ? { id: mine.id, taken: mine.taken, saved: mine.myEntry > 0 } : null);
   }, [analysis, market]);
 
   const depthInfo = useMemo(
@@ -508,7 +538,7 @@ export default function BinanceCopiloto() {
     try {
       let syms = [...tickers].sort((a, b) => b.quoteVol - a.quoteVol).slice(0, 20).map((t) => t.symbol);
       if (!syms.length) syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"];
-      await runBacktest({ symbols: syms, strategy, ind, riskMode, days: btDays, onProgress: setBtProg });
+      await runBacktest({ symbols: syms, strategy, ind, riskMode, days: btDays, tfs: HORIZONS[horizon], onProgress: setBtProg });
       setTrackerTick((t) => t + 1);
     } catch (e) {
       setErr(`El backtest fallo: ${e.message}`);
@@ -633,10 +663,10 @@ export default function BinanceCopiloto() {
       }}>
         <div>
           <div style={{ fontSize: 16, fontWeight: 700 }}>
-            COPILOTO <span style={{ color: C.amber }}>BINANCE</span> <span style={{ color: C.dim, fontSize: 11 }}>v4</span>
+            COPILOTO <span style={{ color: C.amber }}>BINANCE</span> <span style={{ color: C.dim, fontSize: 11 }}>v5</span>
           </div>
           <div style={{ color: C.dim, fontSize: 11, marginTop: 2 }}>
-            velas cerradas · sin repintado · aprende de su propio record
+            3 horizontes · 8 estrategias · aprende de su propio record
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -704,7 +734,13 @@ export default function BinanceCopiloto() {
             display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center",
             background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "10px 12px",
           }}>
-            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>ESTRATEGIA (para Analisis; el escaner corre TODAS):</span>
+            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>HORIZONTE:</span>
+            {HORIZON_KEYS.map((k) => (
+              <button key={k} onClick={() => changeHorizon(k)} style={chipS(horizon === k, "amber")}>
+                {HORIZONS[k].label}
+              </button>
+            ))}
+            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginLeft: 8 }}>ESTRATEGIA (para Analisis; el escaner corre TODAS):</span>
             {STRATEGIES.map(([k, l]) => (
               <button key={k} onClick={() => setStrategy(k)} style={chipS(strategy === k, "amber")}>{l}</button>
             ))}
@@ -918,7 +954,13 @@ export default function BinanceCopiloto() {
             display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center",
             background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "10px 12px",
           }}>
-            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>ESTRATEGIA:</span>
+            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>HORIZONTE:</span>
+            {HORIZON_KEYS.map((k) => (
+              <button key={k} onClick={() => changeHorizon(k)} style={chipS(horizon === k, "green")}>
+                {HORIZONS[k].label}
+              </button>
+            ))}
+            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginLeft: 8 }}>ESTRATEGIA:</span>
             {STRATEGIES.map(([k, l]) => (
               <button key={k} onClick={() => setStrategy(k)} style={chipS(strategy === k, "amber")}>{l}</button>
             ))}
@@ -942,10 +984,8 @@ export default function BinanceCopiloto() {
             padding: "8px 12px", border: `1px dashed ${C.border}`, borderRadius: 4,
             marginBottom: 16, fontSize: 11, color: C.dim, lineHeight: 1.6,
           }}>
-            <span style={{ color: C.amber }}>TEMPORALIDAD:</span> senales INTRADIA — el gatillo es la vela
-            CERRADA de 15m, pero la direccion se valida siempre en 1h y 4h (y con BTC en la META): el 15m
-            nunca se opera aislado. Horizonte tipico de la operacion: 2 a 24 horas; tras TP1 el stop pasa a
-            break-even; a las 48h sin resolverse, expira. No es scalping de 1 minuto ni swing de semanas.
+            <span style={{ color: C.amber }}>HORIZONTE {HORIZONS[horizon].label}:</span>{" "}
+            {HORIZON_DESC[horizon]} La vela del gatillo nunca se opera aislada y tras TP1 el stop pasa a break-even.
           </div>
 
           {!analysis && !analyzing && (
@@ -965,7 +1005,7 @@ export default function BinanceCopiloto() {
                     <div style={{ fontSize: 20, fontWeight: 700 }}>{analysis.symbol}</div>
                     <div style={{ fontSize: 26, marginTop: 4 }}>{fmt(analysis.live)}</div>
                     <div style={{ color: C.dim, fontSize: 11, marginTop: 4 }}>
-                      en vivo · ultimo cierre 15m: {fmt(analysis.tf15.close)}
+                      en vivo · ultimo cierre {HA.gatillo}: {fmt(analysis.tf15.close)} · horizonte {HA.label.toLowerCase()} ({HA.horizonte})
                     </div>
                     <div style={{ color: C.dim, fontSize: 11 }}>
                       Binance spot · {analysis.time.toLocaleTimeString("es-CO")} (Bogota) · {subCat(analysis.symbol)}
@@ -1020,7 +1060,7 @@ export default function BinanceCopiloto() {
                 <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14, marginBottom: 14 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
                     <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em" }}>
-                      GRAFICO 15m - pivotes y niveles<Help k="chart" />
+                      GRAFICO {HA.gatillo} - pivotes y niveles<Help k="chart" />
                     </div>
                     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                       <span style={{ color: C.dim, fontSize: 10 }}>
@@ -1032,7 +1072,7 @@ export default function BinanceCopiloto() {
                         border: `1px solid ${liveMode ? C.green : C.border}`,
                         padding: "3px 10px", borderRadius: 3, cursor: "pointer", fontSize: 10, fontFamily: "inherit",
                       }}>
-                        {liveMode ? "● EN VIVO (20s)" : "○ PAUSADO"}
+                        {liveMode ? `● EN VIVO (${(HA.pollMs / 1000).toFixed(0)}s)` : "○ PAUSADO"}
                       </button>
                     </div>
                   </div>
@@ -1259,7 +1299,7 @@ export default function BinanceCopiloto() {
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 14, marginBottom: 14 }}>
                   <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
                     <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 10 }}>
-                      PIVOTES 15m - confirmados 3 velas despues (sin repintado)<Help k="pivotes" />
+                      PIVOTES {HA.gatillo} - confirmados 3 velas despues (sin repintado)<Help k="pivotes" />
                     </div>
                     {analysis.structure.seq.slice(-7).map((p, i) => (
                       <div key={i} style={{
@@ -1323,7 +1363,7 @@ export default function BinanceCopiloto() {
                     </tr>
                   </thead>
                   <tbody>
-                    {[["4h", analysis.tf4h], ["1h", analysis.tf1h], ["15m", analysis.tf15]].map(([lbl, t]) => (
+                    {[[HA.mayor, analysis.tf4h], [HA.medio, analysis.tf1h], [HA.gatillo, analysis.tf15]].map(([lbl, t]) => (
                       <tr key={lbl} style={{ borderTop: `1px solid ${C.border}` }}>
                         <td style={{ padding: "7px 12px", fontWeight: 700, color: C.amber }}>{lbl}</td>
                         <td style={{ padding: "7px 12px" }}>{fmt(t.close)}</td>
@@ -1341,7 +1381,7 @@ export default function BinanceCopiloto() {
                   </tbody>
                 </table>
                 <div style={{ padding: "0 12px 12px" }}>
-                  <Lectura>{lecturaTF(analysis)}</Lectura>
+                  <Lectura>{lecturaTF(analysis, HA)}</Lectura>
                 </div>
               </div>
 
@@ -1527,6 +1567,29 @@ export default function BinanceCopiloto() {
                         <div style={{ marginTop: 8, fontSize: 11, color: C.amber, lineHeight: 1.5 }}>
                           Tras TP1: mueve tu stop a TU break-even ({fmt(parseFloat(myEntry))}).
                         </div>
+                        {lastRec && (
+                          <button onClick={() => {
+                            if (saveMyOp(lastRec.id, { entry: +myEntry, margin: +myMargin, lev: +myLev })) {
+                              setLastRec({ ...lastRec, taken: true, saved: true });
+                              setTrackerTick((t) => t + 1);
+                            }
+                          }} style={{
+                            marginTop: 12, width: "100%",
+                            background: lastRec.saved ? "#0d2620" : C.accent,
+                            color: lastRec.saved ? C.green : "#fff",
+                            border: lastRec.saved ? `1px solid ${C.green}` : "none",
+                            padding: "9px 14px", borderRadius: 4, cursor: "pointer",
+                            fontWeight: 700, fontSize: 12, fontFamily: "inherit",
+                          }}>
+                            {lastRec.saved ? "✓ OPERACION GUARDADA EN TU REGISTRO" : "GUARDAR MI OPERACION REAL"}
+                          </button>
+                        )}
+                        {lastRec && !lastRec.saved && (
+                          <div style={{ marginTop: 6, fontSize: 10, color: C.dim, lineHeight: 1.5 }}>
+                            Al guardarla, el Record seguira TU operacion con TU entrada, calculara tu PnL real
+                            al resolverse y detectara tus patrones de error de ejecucion.
+                          </div>
+                        )}
                       </>
                     )}
                   </div>
@@ -1695,6 +1758,43 @@ export default function BinanceCopiloto() {
               </div>
             </div>
           </div>
+
+          {recStats.misOps.n > 0 && (
+            <div style={{
+              background: C.panel, border: `1px solid ${C.accent}`, borderRadius: 4,
+              padding: 14, marginBottom: 16,
+            }}>
+              <div style={{ color: C.accent, fontSize: 10, letterSpacing: "0.1em", marginBottom: 10 }}>
+                TUS OPERACIONES REALES ({recStats.misOps.n}) - registro de exito y errores
+              </div>
+              <div style={{ fontSize: 12, marginBottom: 10 }}>
+                Cerradas: {recStats.misOps.n - recStats.misOps.abiertas} ·
+                ganadas: <span style={{ color: C.green }}>{recStats.misOps.wins}</span> ·
+                abiertas: {recStats.misOps.abiertas} ·
+                PnL realizado: <span style={{ color: recStats.misOps.pnl >= 0 ? C.green : C.red, fontWeight: 700 }}>
+                  {recStats.misOps.pnl >= 0 ? "+" : ""}{recStats.misOps.pnl.toFixed(2)} USDT
+                </span>
+              </div>
+              <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 6 }}>ERRORES DETECTADOS</div>
+              <div style={{ fontSize: 11, lineHeight: 1.7, color: "#c9d2dd" }}>
+                {recStats.misOps.slipProm > 0.15
+                  ? <div>⚠ Tus entradas promedian {recStats.misOps.slipProm.toFixed(2)}% PEOR que la senal: estas persiguiendo el precio. Usa la zona de entrada sugerida o dejala ir.</div>
+                  : <div style={{ color: "#7fe8d0" }}>✓ Tus entradas estan alineadas con la senal (desvio promedio {recStats.misOps.slipProm.toFixed(2)}%).</div>}
+                {recStats.misOps.sobreApalancadas > 0
+                  ? <div>⚠ {recStats.misOps.sobreApalancadas} operacion(es) con apalancamiento POR ENCIMA del maximo seguro: la liquidacion queda cerca del stop.</div>
+                  : <div style={{ color: "#7fe8d0" }}>✓ Apalancamiento dentro del maximo seguro en todas.</div>}
+                {recStats.misOps.n >= 3 && recStats.misOps.enMemes / recStats.misOps.n > 0.5
+                  ? <div>⚠ El {((recStats.misOps.enMemes / recStats.misOps.n) * 100).toFixed(0)}% de tus operaciones son memecoins, el segmento con peor historial (46.5%). Diversifica hacia L1.</div>
+                  : recStats.misOps.n >= 3
+                    ? <div style={{ color: "#7fe8d0" }}>✓ Sin concentracion excesiva en memecoins.</div>
+                    : null}
+              </div>
+              <div style={{ marginTop: 8, fontSize: 10, color: C.dim, lineHeight: 1.5 }}>
+                Guarda cada operacion desde el panel MI POSICION REAL en Analisis. Exporta el JSON y compartelo
+                en el chat para un analisis profundo de tus operaciones.
+              </div>
+            </div>
+          )}
 
           {openTaken.length > 0 && (
             <>

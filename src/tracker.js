@@ -103,6 +103,7 @@ export function recordSignal(sig, symbol, live, ts = Date.now()) {
     id: `${symbol}-${ts}`,
     ts, symbol, subcat: sc,
     dir: sig.dir, modo: sig.modo, confidence: sig.confidence,
+    tf: sig.tf ?? "15m", maxLev: sig.maxLev ?? null,
     entry: sig.entry, stop: sig.stop,
     tps: sig.tps.map((t) => ({ pct: t.pct, price: t.price, r: t.r })),
     x: extractFeatures(sig, sc, ts),
@@ -120,6 +121,20 @@ export function markTaken(id, taken = true) {
   const signals = getSignals();
   const s = signals.find((x) => x.id === id);
   if (s) { s.taken = taken; saveSignals(signals); }
+}
+
+// Guarda TU operacion real sobre una senal (entrada, margen y apalancamiento propios).
+// Con esto el Record calcula tu PnL real y detecta patrones de error de ejecucion.
+export function saveMyOp(id, { entry, margin, lev }) {
+  const signals = getSignals();
+  const s = signals.find((x) => x.id === id);
+  if (!s) return false;
+  s.taken = true;
+  s.myEntry = entry;
+  s.myMargin = margin;
+  s.myLev = lev;
+  saveSignals(signals);
+  return true;
 }
 
 /* ---------- Resolucion de resultados ---------- */
@@ -185,12 +200,21 @@ export async function resolveOpenSignals() {
   let resolved = 0;
   for (const s of open) {
     try {
-      const candles = await fetchCandles(s.symbol, "15m", Math.min(1000, EXPIRY_CANDLES + 10), {
+      const candles = await fetchCandles(s.symbol, s.tf ?? "15m", Math.min(1000, EXPIRY_CANDLES + 10), {
         startTime: s.ts,
       });
       const res = resolveOutcome(s, candles);
       if (res) {
         Object.assign(s, { outcome: res.outcome, r: res.r, detail: res.detail, closedAt: res.closedAt });
+        // Si el usuario guardo SU operacion, resolvemos tambien desde SU entrada real.
+        if (s.myEntry > 0 && s.myMargin > 0 && s.myLev > 0) {
+          const mine = resolveOutcome({ ...s, entry: s.myEntry }, candles);
+          if (mine) {
+            s.rMine = mine.r;
+            const riskPct = Math.abs(s.myEntry - s.stop) / s.myEntry;
+            s.pnlUsdt = s.myMargin * s.myLev * riskPct * mine.r;
+          }
+        }
         learnFrom(s, res, buckets, model, 1);
         resolved++;
       }
@@ -216,6 +240,21 @@ export function stats() {
   const live = getSignals().filter((s) => s.outcome !== "open");
   const liveWins = live.filter((s) => s.r > 0).length;
   const liveR = live.reduce((a, s) => a + (s.r ?? 0), 0);
+
+  // TUS operaciones (las que guardaste con entrada/margen/apalancamiento reales)
+  const ops = getSignals().filter((s) => s.myEntry > 0);
+  const opsClosed = ops.filter((s) => s.outcome !== "open");
+  const slip = (s) => ((s.dir === "long" ? s.myEntry - s.entry : s.entry - s.myEntry) / s.entry) * 100;
+  const misOps = {
+    n: ops.length,
+    abiertas: ops.length - opsClosed.length,
+    wins: opsClosed.filter((s) => (s.rMine ?? s.r) > 0).length,
+    pnl: opsClosed.reduce((a, s) => a + (s.pnlUsdt ?? 0), 0),
+    slipProm: ops.length ? ops.reduce((a, s) => a + slip(s), 0) / ops.length : 0,
+    sobreApalancadas: ops.filter((s) => s.maxLev != null && s.myLev > s.maxLev).length,
+    enMemes: ops.filter((s) => s.subcat === "memes").length,
+  };
+
   return {
     rows,
     live: {
@@ -224,6 +263,7 @@ export function stats() {
       winRate: live.length ? liveWins / live.length : 0,
       avgR: live.length ? liveR / live.length : 0,
     },
+    misOps,
     openCount: getSignals().filter((s) => s.outcome === "open").length,
     btMeta: getBtMeta(),
     modelSeen: getModel().seen,
@@ -231,20 +271,21 @@ export function stats() {
 }
 
 /* ---------- Backtest (siembra del historico) ---------- */
-const H15 = 900000, H1 = 3600000, H4 = 14400000;
+const H4 = 14400000;
 
 // Genera senales sobre historico y las resuelve. Solo computa; no toca storage.
-// `step` = cada cuantas velas de 15m se evalua (4 = cada hora).
+// `step` = cada cuantas velas del gatillo se evalua. `msMedio/msMayor` = duracion
+// de las velas media y mayor del horizonte activo.
 export function backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, opts = {}) {
-  const { btcSeries = null, step = 4 } = opts;
+  const { btcSeries = null, step = 4, msMedio = 3600000, msMayor = 14400000, tfLabel = "15m" } = opts;
   const out = [];
   let j1 = -1, j4 = -1;
   let blockLong = -1, blockShort = -1;
 
   for (let i = 300; i < c15.length - 2; i += step) {
     const decisionTime = c15[i + 1].time;
-    while (j1 + 1 < c1h.length && c1h[j1 + 1].time + H1 <= decisionTime) j1++;
-    while (j4 + 1 < c4h.length && c4h[j4 + 1].time + H4 <= decisionTime) j4++;
+    while (j1 + 1 < c1h.length && c1h[j1 + 1].time + msMedio <= decisionTime) j1++;
+    while (j4 + 1 < c4h.length && c4h[j4 + 1].time + msMayor <= decisionTime) j4++;
     if (j1 < 250 || j4 < 210) continue; // suficiente historia para EMA200
 
     const w15 = c15.slice(Math.max(0, i - 299), i + 2); // ultima = "en formacion" (se descarta)
@@ -254,7 +295,7 @@ export function backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, opts
 
     let sig;
     try {
-      const evalOpts = btcSeries ? { btcBias: btcBiasAt(btcSeries, decisionTime) } : {};
+      const evalOpts = { tfLabel, ...(btcSeries ? { btcBias: btcBiasAt(btcSeries, decisionTime) } : {}) };
       sig = evaluate(w15, w1, w4, live, strategy, ind, riskMode, evalOpts);
     } catch { continue; }
     if (!sig.dir) continue;
@@ -281,21 +322,24 @@ export function backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, opts
   return out;
 }
 
-export async function runBacktest({ symbols, strategy, ind, riskMode, days = 90, onProgress }) {
+export async function runBacktest({ symbols, strategy, ind, riskMode, days = 90, tfs = null, onProgress }) {
   const buckets = getBuckets();
   const model = getModel();
   const allSamples = [];
   const sampleRows = [];
   let totalSignals = 0, totalWins = 0, sumR = 0;
   const now = Date.now();
+  const H = tfs ?? { gatillo: "15m", medio: "1h", mayor: "4h", msGatillo: 900000, msMedio: 3600000, msMayor: 14400000 };
+  // El horizonte rapido (5m) genera 3x mas velas: se limita a 90 dias para no reventar la descarga.
+  const effDays = H.gatillo === "5m" ? Math.min(days, 90) : days;
   // Muestreo adaptativo: periodos largos evaluan con paso mayor para no congelar el telefono.
-  const step = days <= 90 ? 4 : days <= 180 ? 6 : 8;
+  const step = effDays <= 90 ? 4 : effDays <= 180 ? 6 : 8;
 
   // La META necesita la historia de BTC 4h para su filtro de sesgo.
   let btcSeries = null;
   if (strategy === "meta") {
     try {
-      const btc4h = await fetchHistory("BTCUSDT", "4h", now - days * 86400000 - 310 * H4);
+      const btc4h = await fetchHistory("BTCUSDT", "4h", now - effDays * 86400000 - 310 * H4);
       btcSeries = btcBiasSeries(btc4h);
     } catch { /* sin BTC: la META correra sin ese filtro y lo advierte */ }
   }
@@ -305,18 +349,20 @@ export async function runBacktest({ symbols, strategy, ind, riskMode, days = 90,
     onProgress?.({ sym, done: si, total: symbols.length, fase: "descargando" });
     let c15, c1h, c4h;
     try {
-      const start = now - days * 86400000;
+      const start = now - effDays * 86400000;
       [c15, c1h, c4h] = await Promise.all([
-        fetchHistory(sym, "15m", start - 310 * H15),
-        fetchHistory(sym, "1h", start - 310 * H1),
-        fetchHistory(sym, "4h", start - 310 * H4),
+        fetchHistory(sym, H.gatillo, start - 310 * H.msGatillo),
+        fetchHistory(sym, H.medio, start - 310 * H.msMedio),
+        fetchHistory(sym, H.mayor, start - 310 * H.msMayor),
       ]);
     } catch { continue; }
     if (!c15?.length || c15.length < 600) continue;
 
     onProgress?.({ sym, done: si, total: symbols.length, fase: "evaluando" });
     await new Promise((r) => setTimeout(r, 0)); // cede el hilo a la UI
-    const recs = backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, { btcSeries, step });
+    const recs = backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, {
+      btcSeries, step, msMedio: H.msMedio, msMayor: H.msMayor, tfLabel: H.gatillo,
+    });
 
     for (const rec of recs) {
       const win = rec.r > 0 ? 1 : 0;
@@ -340,7 +386,7 @@ export async function runBacktest({ symbols, strategy, ind, riskMode, days = 90,
   sampleRows.sort((a, b) => b.ts - a.ts);
   save(K_BTSAMPLE, sampleRows.slice(0, MAX_BTSAMPLE));
   const meta = {
-    ranAt: now, days, strategy, riskMode,
+    ranAt: now, days: effDays, strategy, riskMode, tf: H.gatillo,
     symbols: symbols.length, signals: totalSignals,
     wins: totalWins, winRate: totalSignals ? totalWins / totalSignals : 0,
     avgR: totalSignals ? sumR / totalSignals : 0,

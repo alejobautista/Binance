@@ -89,6 +89,28 @@ export function analyzeDepth(bids, asks, mid, opts = {}) {
   };
 }
 
+/* ---------- HORIZONTES DE OPERACION ---------- */
+// El motor es agnostico a la temporalidad: cambiar el horizonte cambia las velas
+// que alimentan al mismo calculo (gatillo / media / mayor).
+export const HORIZONS = {
+  rapido: {
+    key: "rapido", label: "RAPIDO", gatillo: "5m", medio: "15m", mayor: "1h",
+    msGatillo: 300000, msMedio: 900000, msMayor: 3600000,
+    horizonte: "30 minutos a 6 horas", pollMs: 10000,
+  },
+  intradia: {
+    key: "intradia", label: "INTRADIA", gatillo: "15m", medio: "1h", mayor: "4h",
+    msGatillo: 900000, msMedio: 3600000, msMayor: 14400000,
+    horizonte: "2 a 24 horas", pollMs: 20000,
+  },
+  swing: {
+    key: "swing", label: "SWING", gatillo: "1h", medio: "4h", mayor: "1d",
+    msGatillo: 3600000, msMedio: 14400000, msMayor: 86400000,
+    horizonte: "1 a 8 dias", pollMs: 60000,
+  },
+};
+export const HORIZON_KEYS = ["rapido", "intradia", "swing"];
+
 export const fmtQ = (q) =>
   q >= 1e6 ? `${(q / 1e6).toFixed(2)}M` : `${(q / 1e3).toFixed(0)}K`;
 
@@ -497,7 +519,7 @@ export function buildLevels(dir, live, A, stopPrice, tf15, tf1h, strict) {
         { pct: 25, price: entry + risk * 3.0, r: 3.0 },
       ],
       maxLev: Math.max(1, Math.min(10, Math.floor(100 / (stopPct * 1.6)))),
-      invalidation: `Cierre 15m bajo ${fmt(stop)} anula el setup.`,
+      invalidation: `Cierre bajo ${fmt(stop)} (vela de gatillo) anula el setup.`,
     };
   }
   const stop = stopPrice;
@@ -522,7 +544,7 @@ export function buildLevels(dir, live, A, stopPrice, tf15, tf1h, strict) {
       { pct: 25, price: entry - risk * 3.0, r: 3.0 },
     ],
     maxLev: Math.max(1, Math.min(10, Math.floor(100 / (stopPct * 1.6)))),
-    invalidation: `Cierre 15m sobre ${fmt(stop)} anula el setup.`,
+    invalidation: `Cierre sobre ${fmt(stop)} (vela de gatillo) anula el setup.`,
   };
 }
 
@@ -718,12 +740,12 @@ export function buildStructureSignal(c15, tf15, c1h, tf1h, live, riskMode) {
   if (!lastEv) {
     invalidation = "Sin eventos de estructura (BOS/CHoCH) en las velas analizadas.";
   } else if (age > RECENT) {
-    invalidation = `Ultimo evento: ${lastEv.type} en ${fmt(lastEv.level)} hace ${age} velas de 15m - ya no es accionable. Esperar un nuevo BOS o CHoCH.`;
+    invalidation = `Ultimo evento: ${lastEv.type} en ${fmt(lastEv.level)} hace ${age} velas - ya no es accionable. Esperar un nuevo BOS o CHoCH.`;
   } else if (lastEv.dir === "up") {
     const isBos = lastEv.type.startsWith("BOS");
     if (isBos && st1h.trend === -1 && strict) {
       blockedDir = "long";
-      invalidation = `BOS alcista en 15m (hace ${age} velas) pero la estructura 1h sigue bajista: ruptura contra la tendencia mayor. Mejor esperar CHoCH tambien en 1h.`;
+      invalidation = `BOS alcista en el gatillo (hace ${age} velas) pero la estructura media sigue bajista: ruptura contra la tendencia mayor. Mejor esperar CHoCH tambien alli.`;
     } else {
       if (isBos && st1h.trend === -1) warnings.push("Advertencia: BOS alcista contra la estructura bajista de 1h.");
       signal = "LARGO"; dir = "long";
@@ -733,7 +755,7 @@ export function buildStructureSignal(c15, tf15, c1h, tf1h, live, riskMode) {
     const isBos = lastEv.type.startsWith("BOS");
     if (isBos && st1h.trend === 1 && strict) {
       blockedDir = "short";
-      invalidation = `BOS bajista en 15m (hace ${age} velas) pero la estructura 1h sigue alcista: ruptura contra la tendencia mayor. Mejor esperar CHoCH tambien en 1h.`;
+      invalidation = `BOS bajista en el gatillo (hace ${age} velas) pero la estructura media sigue alcista: ruptura contra la tendencia mayor. Mejor esperar CHoCH tambien alli.`;
     } else {
       if (isBos && st1h.trend === 1) warnings.push("Advertencia: BOS bajista contra la estructura alcista de 1h.");
       signal = "CORTO"; dir = "short";
@@ -1273,7 +1295,7 @@ export function evaluate(c15, c1h, c4h, live, strategy, ind, riskMode, opts = {}
   const t1h = analyzeTF(c1hc);
   const t4h = analyzeTF(closed(c4h));
   const sig = buildFor(strategy, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts);
-  return { tf15: t15, tf1h: t1h, tf4h: t4h, ...sig };
+  return { tf15: t15, tf1h: t1h, tf4h: t4h, tf: opts.tfLabel ?? "15m", ...sig };
 }
 
 // Corre TODAS las estrategias sobre las mismas velas (los analisis TF se computan una sola vez).
@@ -1285,7 +1307,7 @@ export function evaluateAll(c15, c1h, c4h, live, ind, riskMode, opts = {}) {
   const t4h = analyzeTF(closed(c4h));
   return STRATEGY_KEYS.map((k) => {
     try {
-      return { strategy: k, sig: { tf15: t15, tf1h: t1h, tf4h: t4h, ...buildFor(k, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts) } };
+      return { strategy: k, sig: { tf15: t15, tf1h: t1h, tf4h: t4h, tf: opts.tfLabel ?? "15m", ...buildFor(k, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts) } };
     } catch {
       return { strategy: k, sig: null };
     }
@@ -1344,5 +1366,6 @@ export function segmentKeys(sig, subcat) {
     `estrategia:${sig.modo}|dir:${d}`,
     `conf:${sig.confidence}`,
     `subcat:${subcat}`,
+    `tf:${sig.tf ?? "15m"}`,
   ];
 }
