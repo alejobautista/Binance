@@ -617,17 +617,18 @@ export default function BinanceCopiloto() {
   }, [filteredRows]);
 
   // Ranking de estrategias por ratio de exito (win rate de TODOS los buckets +
-  // R medio de la muestra guardada), filtrable por horizonte.
-  const [rankTf, setRankTf] = useState("todas");
+  // R medio de la muestra guardada). Obedece SOLO al filtro de horizonte,
+  // nunca al de estrategia (su razon de ser es comparar todas).
   const ranking = useMemo(() => {
     const find = (key) => recStats.rows.find((r) => r.key === key);
     const sample = recordRows.filter((s) =>
-      s.outcome !== "open" && s.r != null && (rankTf === "todas" || (s.tf ?? "15m") === rankTf)
+      s.outcome !== "open" && s.r != null && (fTf === "todas" || (s.tf ?? "15m") === fTf)
     );
+    const suf = fTf === "todas" ? "" : `|tf:${fTf}`;
     return STRATEGIES.map(([k]) => {
-      const g = find(rankTf === "todas" ? `estrategia:${k}` : `estrategia:${k}|tf:${rankTf}`);
-      const l = rankTf === "todas" ? find(`estrategia:${k}|dir:largo`) : null;
-      const c = rankTf === "todas" ? find(`estrategia:${k}|dir:corto`) : null;
+      const g = find(fTf === "todas" ? `estrategia:${k}` : `estrategia:${k}|tf:${fTf}`);
+      const l = find(`estrategia:${k}|dir:largo${suf}`);
+      const c = find(`estrategia:${k}|dir:corto${suf}`);
       const rs = sample.filter((s) => s.modo === k);
       return {
         k, n: g?.n ?? 0, win: g?.winRate ?? null,
@@ -636,7 +637,7 @@ export default function BinanceCopiloto() {
         avgR: rs.length ? rs.reduce((a, s) => a + s.r, 0) / rs.length : null, nR: rs.length,
       };
     }).filter((r) => r.n > 0).sort((a, b) => (b.win ?? 0) - (a.win ?? 0));
-  }, [recStats, recordRows, rankTf]);
+  }, [recStats, recordRows, fTf]);
 
   // Posiciones vivas: senales marcadas "la tome" que siguen abiertas.
   const openTaken = useMemo(
@@ -665,15 +666,20 @@ export default function BinanceCopiloto() {
   }, [tab, openTaken.length]);
 
   // Curva de R acumulado (cada punto = una senal resuelta, en orden temporal).
+  // Obedece a los filtros globales del Record (estrategia, direccion, horizonte).
   const curves = useMemo(() => {
+    const match = (s) =>
+      (fModo === "todas" || s.modo === fModo) &&
+      (fDir === "todas" || s.dir === fDir) &&
+      (fTf === "todas" || (s.tf ?? "15m") === fTf);
     const cum = (arr) => { let c = 0; return arr.map((s) => (c += s.r ?? 0)); };
-    const live = getSignals().filter((s) => s.outcome !== "open" && s.r != null).sort((a, b) => a.ts - b.ts);
-    const bt = getBtSample().filter((s) => s.r != null).sort((a, b) => a.ts - b.ts);
+    const live = getSignals().filter((s) => s.outcome !== "open" && s.r != null && match(s)).sort((a, b) => a.ts - b.ts);
+    const bt = getBtSample().filter((s) => s.r != null && match(s)).sort((a, b) => a.ts - b.ts);
     const series = [];
     if (bt.length >= 2) series.push({ label: "backtest (muestra)", color: "#fbbf24", points: cum(bt) });
     if (live.length >= 2) series.push({ label: "en vivo", color: "#00d4aa", points: cum(live) });
     return series;
-  }, [trackerTick, tab]);
+  }, [trackerTick, tab, fModo, fDir, fTf]);
 
   /* ---------- Estilos ---------- */
   const sigColor = analysis?.signal === "LARGO" ? C.green : analysis?.signal === "CORTO" ? C.red : C.dim;
@@ -1779,6 +1785,36 @@ export default function BinanceCopiloto() {
             <div style={{ color: C.dim, fontSize: 12, marginBottom: 16 }}>{verifyMsg}</div>
           )}
 
+          <div style={{
+            background: C.panel, border: `1px solid ${C.accent}`, borderRadius: 4,
+            padding: "10px 12px", marginBottom: 16,
+          }}>
+            <div style={{ color: C.accent, fontSize: 10, letterSpacing: "0.1em", marginBottom: 8 }}>
+              FILTROS DEL RECORD - cambian la curva y las senales; el ranking solo obedece al HORIZONTE
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 6 }}>
+              <span style={{ color: C.dim, fontSize: 10 }}>ESTRATEGIA:</span>
+              <button onClick={() => setFModo("todas")} style={chipS(fModo === "todas", "amber")}>TODAS</button>
+              {STRATEGIES.map(([k]) => (
+                <button key={k} onClick={() => setFModo(k)} style={chipS(fModo === k, "amber")}>{k.toUpperCase()}</button>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              <span style={{ color: C.dim, fontSize: 10 }}>DIRECCION:</span>
+              {[["todas", "TODAS"], ["long", "LARGOS"], ["short", "CORTOS"]].map(([k, l]) => (
+                <button key={k} onClick={() => setFDir(k)} style={chipS(fDir === k, "green")}>{l}</button>
+              ))}
+              <span style={{ color: C.dim, fontSize: 10, marginLeft: 8 }}>RESULTADO:</span>
+              {[["todos", "TODOS"], ["ganadas", "GANADAS"], ["perdidas", "PERDIDAS"], ["abiertas", "ABIERTAS"]].map(([k, l]) => (
+                <button key={k} onClick={() => setFOut(k)} style={chipS(fOut === k, "green")}>{l}</button>
+              ))}
+              <span style={{ color: C.dim, fontSize: 10, marginLeft: 8 }}>HORIZONTE:</span>
+              {[["todas", "TODOS"], ["5m", "5m"], ["15m", "15m"], ["1h", "1h"]].map(([k, l]) => (
+                <button key={k} onClick={() => setFTf(k)} style={chipS(fTf === k, "amber")}>{l}</button>
+              ))}
+            </div>
+          </div>
+
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 12, marginBottom: 16 }}>
             <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
               <div style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginBottom: 8 }}>SENALES EN VIVO</div>
@@ -1925,7 +1961,13 @@ export default function BinanceCopiloto() {
           {curves.length > 0 && (
             <>
               <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
-                CURVA DE RESULTADOS - R ACUMULADO<Help k="curva" />
+                CURVA DE RESULTADOS - R ACUMULADO
+                {(fModo !== "todas" || fDir !== "todas" || fTf !== "todas") && (
+                  <span style={{ color: C.amber }}>
+                    {" "}· filtro: {fModo !== "todas" ? fModo : ""} {fDir !== "todas" ? (fDir === "long" ? "largos" : "cortos") : ""} {fTf !== "todas" ? fTf : ""}
+                  </span>
+                )}
+                <Help k="curva" />
               </div>
               <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14, marginBottom: 16 }}>
                 <EquityCurve series={curves} />
@@ -1946,10 +1988,9 @@ export default function BinanceCopiloto() {
                 <div style={{ color: C.amber, fontSize: 11, letterSpacing: "0.1em" }}>
                   RANKING DE ESTRATEGIAS - ¿cual tiene mejor ratio de exito?
                 </div>
-                <span style={{ color: C.dim, fontSize: 10 }}>HORIZONTE:</span>
-                {[["todas", "TODOS"], ["5m", "5m"], ["15m", "15m"], ["1h", "1h"]].map(([k, l]) => (
-                  <button key={k} onClick={() => setRankTf(k)} style={chipS(rankTf === k, "amber")}>{l}</button>
-                ))}
+                <span style={{ color: C.dim, fontSize: 10 }}>
+                  horizonte: {fTf === "todas" ? "TODOS" : fTf} (se cambia en los filtros de arriba; los demas filtros no afectan al ranking)
+                </span>
               </div>
               <div style={{ background: C.panel, border: `1px solid ${C.amber}`, borderRadius: 4, overflow: "auto", marginBottom: 16 }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
@@ -2025,34 +2066,7 @@ export default function BinanceCopiloto() {
           )}
 
           <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 8 }}>
-            SENALES RECIENTES (en vivo + muestra del backtest)
-          </div>
-          <div style={{
-            display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap", alignItems: "center",
-            background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "8px 10px",
-          }}>
-            <span style={{ color: C.dim, fontSize: 10 }}>ESTRATEGIA:</span>
-            <button onClick={() => setFModo("todas")} style={chipS(fModo === "todas", "amber")}>TODAS</button>
-            {STRATEGIES.map(([k]) => (
-              <button key={k} onClick={() => setFModo(k)} style={chipS(fModo === k, "amber")}>{k.toUpperCase()}</button>
-            ))}
-          </div>
-          <div style={{
-            display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap", alignItems: "center",
-            background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "8px 10px",
-          }}>
-            <span style={{ color: C.dim, fontSize: 10 }}>DIRECCION:</span>
-            {[["todas", "TODAS"], ["long", "LARGOS"], ["short", "CORTOS"]].map(([k, l]) => (
-              <button key={k} onClick={() => setFDir(k)} style={chipS(fDir === k, "green")}>{l}</button>
-            ))}
-            <span style={{ color: C.dim, fontSize: 10, marginLeft: 8 }}>RESULTADO:</span>
-            {[["todos", "TODOS"], ["ganadas", "GANADAS"], ["perdidas", "PERDIDAS"], ["abiertas", "ABIERTAS"]].map(([k, l]) => (
-              <button key={k} onClick={() => setFOut(k)} style={chipS(fOut === k, "green")}>{l}</button>
-            ))}
-            <span style={{ color: C.dim, fontSize: 10, marginLeft: 8 }}>HORIZONTE:</span>
-            {[["todas", "TODOS"], ["5m", "5m"], ["15m", "15m"], ["1h", "1h"]].map(([k, l]) => (
-              <button key={k} onClick={() => setFTf(k)} style={chipS(fTf === k, "amber")}>{l}</button>
-            ))}
+            SENALES RECIENTES (en vivo + muestra del backtest) - obedecen los FILTROS de arriba
           </div>
           {filterSummary && (fModo !== "todas" || fDir !== "todas" || fOut !== "todos" || fTf !== "todas") && (
             <div style={{ color: C.text, fontSize: 12, marginBottom: 8 }}>

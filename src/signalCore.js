@@ -1381,6 +1381,7 @@ export function segmentKeys(sig, subcat) {
     `estrategia:${sig.modo}`,
     `estrategia:${sig.modo}|dir:${d}`,
     `estrategia:${sig.modo}|tf:${tf}`,
+    `estrategia:${sig.modo}|dir:${d}|tf:${tf}`,
     `conf:${sig.confidence}`,
     `subcat:${subcat}`,
     `tf:${tf}`,

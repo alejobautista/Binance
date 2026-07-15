@@ -14,8 +14,8 @@ const K_BUCKETS = "cb_buckets_v1";
 const K_BTSAMPLE = "cb_btsample_v1";
 const K_BTMETA = "cb_btmeta_v1";
 
-const MAX_LIVE = 500;       // tope de senales en vivo guardadas
-const MAX_BTSAMPLE = 300;   // muestra de backtest para la tabla
+const MAX_LIVE = 500;        // tope de senales en vivo guardadas
+const MAX_BTSAMPLE = 1500;   // muestra de backtest para tabla, curva y R medio filtrado
 const EXPIRY_CANDLES = 192; // 48h en velas de 15m
 const DEDUPE_MS = 3 * 3600 * 1000; // no repetir misma senal (simbolo+dir+modo) en 3h
 
