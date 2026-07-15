@@ -1165,11 +1165,16 @@ export function buildMetaSignal(c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, 
   });
 
   const candidates = [];
-  for (const st of META_SUBS) {
-    try {
-      const s = buildFor(st, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode);
-      if (s.dir) candidates.push({ st, sig: s });
-    } catch { /* estrategia sin datos suficientes */ }
+  if (opts.candidates) {
+    // Sub-senales ya calculadas por evaluateAll: no repetir el trabajo.
+    candidates.push(...opts.candidates);
+  } else {
+    for (const st of META_SUBS) {
+      try {
+        const s = buildFor(st, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode);
+        if (s.dir) candidates.push({ st, sig: s });
+      } catch { /* estrategia sin datos suficientes */ }
+    }
   }
 
   const core = [];
@@ -1298,20 +1303,30 @@ export function evaluate(c15, c1h, c4h, live, strategy, ind, riskMode, opts = {}
   return { tf15: t15, tf1h: t1h, tf4h: t4h, tf: opts.tfLabel ?? "15m", ...sig };
 }
 
-// Corre TODAS las estrategias sobre las mismas velas (los analisis TF se computan una sola vez).
+// Corre TODAS las estrategias sobre las mismas velas: los analisis TF se computan
+// una sola vez y la META reutiliza las sub-senales en vez de recalcularlas.
 export function evaluateAll(c15, c1h, c4h, live, ind, riskMode, opts = {}) {
   const closed = (arr) => arr.slice(0, -1);
   const c15c = closed(c15), c1hc = closed(c1h);
   const t15 = analyzeTF(c15c);
   const t1h = analyzeTF(c1hc);
   const t4h = analyzeTF(closed(c4h));
-  return STRATEGY_KEYS.map((k) => {
+  const base = { tf15: t15, tf1h: t1h, tf4h: t4h, tf: opts.tfLabel ?? "15m" };
+  const results = [];
+  const candidates = [];
+  for (const k of STRATEGY_KEYS) {
+    if (k === "meta") continue;
     try {
-      return { strategy: k, sig: { tf15: t15, tf1h: t1h, tf4h: t4h, tf: opts.tfLabel ?? "15m", ...buildFor(k, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts) } };
-    } catch {
-      return { strategy: k, sig: null };
-    }
-  }).filter((r) => r.sig);
+      const s = buildFor(k, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts);
+      results.push({ strategy: k, sig: { ...base, ...s } });
+      if (s.dir) candidates.push({ st: k, sig: s });
+    } catch { /* sin datos */ }
+  }
+  try {
+    const m = buildMetaSignal(c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, { ...opts, candidates });
+    results.unshift({ strategy: "meta", sig: { ...base, ...m } });
+  } catch { /* sin datos */ }
+  return results;
 }
 
 /* ---------- FEATURES PARA EL MOTOR DE PROBABILIDAD ---------- */
@@ -1360,12 +1375,14 @@ export function extractFeatures(sig, subcat, ts) {
 // Claves de segmento para los buckets bayesianos (el "por que" explicable).
 export function segmentKeys(sig, subcat) {
   const d = sig.dir === "short" ? "corto" : "largo";
+  const tf = sig.tf ?? "15m";
   return [
     "global",
     `estrategia:${sig.modo}`,
     `estrategia:${sig.modo}|dir:${d}`,
+    `estrategia:${sig.modo}|tf:${tf}`,
     `conf:${sig.confidence}`,
     `subcat:${subcat}`,
-    `tf:${sig.tf ?? "15m"}`,
+    `tf:${tf}`,
   ];
 }

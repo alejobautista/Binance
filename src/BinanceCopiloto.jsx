@@ -531,6 +531,8 @@ export default function BinanceCopiloto() {
   };
 
   const [btDays, setBtDays] = useState(90);
+  const [btAllStrats, setBtAllStrats] = useState(true);
+  const [btAllHz, setBtAllHz] = useState(false);
   const doBacktest = async () => {
     if (btBusy) return;
     setBtBusy(true);
@@ -538,7 +540,14 @@ export default function BinanceCopiloto() {
     try {
       let syms = [...tickers].sort((a, b) => b.quoteVol - a.quoteVol).slice(0, 20).map((t) => t.symbol);
       if (!syms.length) syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"];
-      await runBacktest({ symbols: syms, strategy, ind, riskMode, days: btDays, tfs: HORIZONS[horizon], onProgress: setBtProg });
+      await runBacktest({
+        symbols: syms,
+        strategy,
+        strategies: btAllStrats ? STRATEGIES.map(([k]) => k) : [strategy],
+        ind, riskMode, days: btDays,
+        tfsList: btAllHz ? HORIZON_KEYS.map((k) => HORIZONS[k]) : [HORIZONS[horizon]],
+        onProgress: setBtProg,
+      });
       setTrackerTick((t) => t + 1);
     } catch (e) {
       setErr(`El backtest fallo: ${e.message}`);
@@ -586,14 +595,16 @@ export default function BinanceCopiloto() {
   const [fModo, setFModo] = useState("todas");
   const [fDir, setFDir] = useState("todas");
   const [fOut, setFOut] = useState("todos");
+  const [fTf, setFTf] = useState("todas");
   const filteredRows = useMemo(() => recordRows.filter((s) =>
     (fModo === "todas" || s.modo === fModo) &&
     (fDir === "todas" || s.dir === fDir) &&
+    (fTf === "todas" || (s.tf ?? "15m") === fTf) &&
     (fOut === "todos" ||
       (fOut === "ganadas" && s.outcome !== "open" && (s.r ?? 0) > 0) ||
       (fOut === "perdidas" && s.outcome !== "open" && (s.r ?? 0) <= 0) ||
       (fOut === "abiertas" && s.outcome === "open"))
-  ), [recordRows, fModo, fDir, fOut]);
+  ), [recordRows, fModo, fDir, fOut, fTf]);
   const filterSummary = useMemo(() => {
     const closed = filteredRows.filter((s) => s.outcome !== "open" && s.r != null);
     if (!closed.length) return null;
@@ -606,14 +617,17 @@ export default function BinanceCopiloto() {
   }, [filteredRows]);
 
   // Ranking de estrategias por ratio de exito (win rate de TODOS los buckets +
-  // R medio de la muestra guardada).
+  // R medio de la muestra guardada), filtrable por horizonte.
+  const [rankTf, setRankTf] = useState("todas");
   const ranking = useMemo(() => {
     const find = (key) => recStats.rows.find((r) => r.key === key);
-    const sample = recordRows.filter((s) => s.outcome !== "open" && s.r != null);
+    const sample = recordRows.filter((s) =>
+      s.outcome !== "open" && s.r != null && (rankTf === "todas" || (s.tf ?? "15m") === rankTf)
+    );
     return STRATEGIES.map(([k]) => {
-      const g = find(`estrategia:${k}`);
-      const l = find(`estrategia:${k}|dir:largo`);
-      const c = find(`estrategia:${k}|dir:corto`);
+      const g = find(rankTf === "todas" ? `estrategia:${k}` : `estrategia:${k}|tf:${rankTf}`);
+      const l = rankTf === "todas" ? find(`estrategia:${k}|dir:largo`) : null;
+      const c = rankTf === "todas" ? find(`estrategia:${k}|dir:corto`) : null;
       const rs = sample.filter((s) => s.modo === k);
       return {
         k, n: g?.n ?? 0, win: g?.winRate ?? null,
@@ -622,7 +636,7 @@ export default function BinanceCopiloto() {
         avgR: rs.length ? rs.reduce((a, s) => a + s.r, 0) / rs.length : null, nR: rs.length,
       };
     }).filter((r) => r.n > 0).sort((a, b) => (b.win ?? 0) - (a.win ?? 0));
-  }, [recStats, recordRows]);
+  }, [recStats, recordRows, rankTf]);
 
   // Posiciones vivas: senales marcadas "la tome" que siguen abiertas.
   const openTaken = useMemo(
@@ -1720,6 +1734,14 @@ export default function BinanceCopiloto() {
                 {dd === 365 ? "1 AÑO" : `${dd}D`}
               </button>
             ))}
+            <span style={{ color: C.dim, fontSize: 10, marginLeft: 6 }}>ESTRATEGIAS:</span>
+            {[[true, "TODAS (8)"], [false, "SOLO ACTUAL"]].map(([v, l]) => (
+              <button key={l} onClick={() => setBtAllStrats(v)} disabled={btBusy} style={chipS(btAllStrats === v, "green")}>{l}</button>
+            ))}
+            <span style={{ color: C.dim, fontSize: 10, marginLeft: 6 }}>HORIZONTES:</span>
+            {[[false, HORIZONS[horizon].label], [true, "LOS 3"]].map(([v, l]) => (
+              <button key={l} onClick={() => setBtAllHz(v)} disabled={btBusy} style={chipS(btAllHz === v, "green")}>{l}</button>
+            ))}
             <button onClick={doExport} style={{ ...btnS("transparent", C.dim), border: `1px solid ${C.border}` }}>EXPORTAR</button>
             <button onClick={() => importRef.current?.click()} style={{ ...btnS("transparent", C.dim), border: `1px solid ${C.border}` }}>IMPORTAR</button>
             <input ref={importRef} type="file" accept="application/json" onChange={doImport} style={{ display: "none" }} />
@@ -1732,7 +1754,7 @@ export default function BinanceCopiloto() {
               padding: 14, marginBottom: 16, fontSize: 12,
             }}>
               <div style={{ color: C.amber, marginBottom: 8 }}>
-                Backtest {btProg.fase}{btProg.sym ? `: ${btProg.sym}` : ""} ({btProg.done}/{btProg.total} pares)
+                Backtest {btProg.fase}{btProg.sym ? `: ${btProg.sym}` : ""}{btProg.tf ? ` · ${btProg.tf}` : ""} ({btProg.done}/{btProg.total})
               </div>
               <div style={{ height: 6, background: C.border, borderRadius: 3 }}>
                 <div style={{
@@ -1741,9 +1763,14 @@ export default function BinanceCopiloto() {
                 }} />
               </div>
               <div style={{ color: C.dim, fontSize: 11, marginTop: 8 }}>
-                Descarga {btDays} dias de velas por par y corre la estrategia "{strategy}" con tus filtros actuales.
-                {btDays <= 90 ? " Suele tardar 1-2 minutos." : btDays <= 180 ? " Suele tardar 3-6 minutos." : " Un año tarda 8-15 minutos (35,000 velas por par); dejalo con la pantalla encendida."}
-                {" "}No cierres la pestana.
+                Descarga {btDays} dias de velas por par y corre {btAllStrats ? "LAS 8 ESTRATEGIAS a la vez (mismas velas, una sola descarga)" : `la estrategia "${strategy}"`}
+                {btAllHz ? " en LOS 3 HORIZONTES" : ` en horizonte ${HORIZONS[horizon].label}`}.
+                {(() => {
+                  const mult = (btAllStrats ? 2 : 1) * (btAllHz ? 3 : 1);
+                  const baseMin = btDays <= 90 ? 2 : btDays <= 180 ? 5 : 12;
+                  return ` Tiempo estimado: ~${baseMin * mult}-${baseMin * mult * 2} minutos.`;
+                })()}
+                {" "}Dejalo con la pantalla encendida y no cierres la pestana.
               </div>
             </div>
           )}
@@ -1915,8 +1942,14 @@ export default function BinanceCopiloto() {
 
           {ranking.length > 0 && (
             <>
-              <div style={{ color: C.amber, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
-                RANKING DE ESTRATEGIAS - ¿cual tiene mejor ratio de exito?
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                <div style={{ color: C.amber, fontSize: 11, letterSpacing: "0.1em" }}>
+                  RANKING DE ESTRATEGIAS - ¿cual tiene mejor ratio de exito?
+                </div>
+                <span style={{ color: C.dim, fontSize: 10 }}>HORIZONTE:</span>
+                {[["todas", "TODOS"], ["5m", "5m"], ["15m", "15m"], ["1h", "1h"]].map(([k, l]) => (
+                  <button key={k} onClick={() => setRankTf(k)} style={chipS(rankTf === k, "amber")}>{l}</button>
+                ))}
               </div>
               <div style={{ background: C.panel, border: `1px solid ${C.amber}`, borderRadius: 4, overflow: "auto", marginBottom: 16 }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
@@ -2016,8 +2049,12 @@ export default function BinanceCopiloto() {
             {[["todos", "TODOS"], ["ganadas", "GANADAS"], ["perdidas", "PERDIDAS"], ["abiertas", "ABIERTAS"]].map(([k, l]) => (
               <button key={k} onClick={() => setFOut(k)} style={chipS(fOut === k, "green")}>{l}</button>
             ))}
+            <span style={{ color: C.dim, fontSize: 10, marginLeft: 8 }}>HORIZONTE:</span>
+            {[["todas", "TODOS"], ["5m", "5m"], ["15m", "15m"], ["1h", "1h"]].map(([k, l]) => (
+              <button key={k} onClick={() => setFTf(k)} style={chipS(fTf === k, "amber")}>{l}</button>
+            ))}
           </div>
-          {filterSummary && (fModo !== "todas" || fDir !== "todas" || fOut !== "todos") && (
+          {filterSummary && (fModo !== "todas" || fDir !== "todas" || fOut !== "todos" || fTf !== "todas") && (
             <div style={{ color: C.text, fontSize: 12, marginBottom: 8 }}>
               Filtro actual: {filterSummary.n} resueltas ·{" "}
               <span style={{ color: filterSummary.winRate >= 0.5 ? C.green : C.red, fontWeight: 700 }}>

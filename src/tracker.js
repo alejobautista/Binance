@@ -3,7 +3,7 @@
    y backtest historico para sembrar el record. */
 
 import {
-  fetchCandles, fetchHistory, evaluate, extractFeatures, segmentKeys,
+  fetchCandles, fetchHistory, evaluate, evaluateAll, extractFeatures, segmentKeys,
   btcBiasSeries, btcBiasAt,
 } from "./signalCore.js";
 import { loadModel, saveModel, train, trainBatch, predict, topFactors, resetModel } from "./model.js";
@@ -274,15 +274,21 @@ export function stats() {
 const H4 = 14400000;
 
 // Genera senales sobre historico y las resuelve. Solo computa; no toca storage.
-// `step` = cada cuantas velas del gatillo se evalua. `msMedio/msMayor` = duracion
-// de las velas media y mayor del horizonte activo.
-export function backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, opts = {}) {
+// `strategies` puede ser una clave o una lista: con lista, las velas se evaluan
+// UNA vez por ventana y todas las estrategias comparten los analisis TF.
+// Async: cede el hilo periodicamente para no congelar la UI.
+export async function backtestSymbol(sym, c15, c1h, c4h, strategies, ind, riskMode, opts = {}) {
+  const list = Array.isArray(strategies) ? strategies : [strategies];
   const { btcSeries = null, step = 4, msMedio = 3600000, msMayor = 14400000, tfLabel = "15m" } = opts;
   const out = [];
-  let j1 = -1, j4 = -1;
-  let blockLong = -1, blockShort = -1;
+  let j1 = -1, j4 = -1, sinceYield = 0;
+  const blockL = {}, blockS = {}; // cooldown de dedupe por estrategia
 
   for (let i = 300; i < c15.length - 2; i += step) {
+    if (++sinceYield >= 40) {
+      sinceYield = 0;
+      await new Promise((r) => setTimeout(r, 0)); // respira: UI viva durante el computo
+    }
     const decisionTime = c15[i + 1].time;
     while (j1 + 1 < c1h.length && c1h[j1 + 1].time + msMedio <= decisionTime) j1++;
     while (j4 + 1 < c4h.length && c4h[j4 + 1].time + msMayor <= decisionTime) j4++;
@@ -293,91 +299,109 @@ export function backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, opts
     const w4 = c4h.slice(Math.max(0, j4 - 299), j4 + 1); w4.push(c4h[j4]);
     const live = c15[i + 1].open;
 
-    let sig;
+    let sigs;
     try {
       const evalOpts = { tfLabel, ...(btcSeries ? { btcBias: btcBiasAt(btcSeries, decisionTime) } : {}) };
-      sig = evaluate(w15, w1, w4, live, strategy, ind, riskMode, evalOpts);
+      sigs = list.length === 1
+        ? [{ strategy: list[0], sig: evaluate(w15, w1, w4, live, list[0], ind, riskMode, evalOpts) }]
+        : evaluateAll(w15, w1, w4, live, ind, riskMode, evalOpts).filter((r) => list.includes(r.strategy));
     } catch { continue; }
-    if (!sig.dir) continue;
-    if (sig.dir === "long" && i <= blockLong) continue;
-    if (sig.dir === "short" && i <= blockShort) continue;
 
-    const rec = {
-      ts: decisionTime, symbol: sym, dir: sig.dir, modo: sig.modo,
-      confidence: sig.confidence, entry: sig.entry, stop: sig.stop, tps: sig.tps,
-    };
-    const res = resolveOutcome(rec, c15.slice(i + 1));
-    if (!res) continue; // final del historico sin resolver
+    for (const { strategy: st, sig } of sigs) {
+      if (!sig.dir) continue;
+      if (sig.dir === "long" && i <= (blockL[st] ?? -1)) continue;
+      if (sig.dir === "short" && i <= (blockS[st] ?? -1)) continue;
 
-    if (sig.dir === "long") blockLong = i + 16; else blockShort = i + 16;
-    const sc = subCat(sym);
-    out.push({
-      ...rec, subcat: sc,
-      x: extractFeatures(sig, sc, decisionTime),
-      segKeys: segmentKeys(sig, sc),
-      outcome: res.outcome, r: res.r, detail: res.detail, closedAt: res.closedAt,
-      source: "backtest",
-    });
+      const rec = {
+        ts: decisionTime, symbol: sym, dir: sig.dir, modo: sig.modo, tf: tfLabel,
+        confidence: sig.confidence, entry: sig.entry, stop: sig.stop, tps: sig.tps,
+      };
+      const res = resolveOutcome(rec, c15.slice(i + 1));
+      if (!res) continue; // final del historico sin resolver
+
+      if (sig.dir === "long") blockL[st] = i + 16; else blockS[st] = i + 16;
+      const sc = subCat(sym);
+      out.push({
+        ...rec, subcat: sc,
+        x: extractFeatures(sig, sc, decisionTime),
+        segKeys: segmentKeys(sig, sc),
+        outcome: res.outcome, r: res.r, detail: res.detail, closedAt: res.closedAt,
+        source: "backtest",
+      });
+    }
   }
   return out;
 }
 
-export async function runBacktest({ symbols, strategy, ind, riskMode, days = 90, tfs = null, onProgress }) {
+export async function runBacktest({
+  symbols, strategy, strategies = null, ind, riskMode, days = 90,
+  tfs = null, tfsList = null, onProgress,
+}) {
   const buckets = getBuckets();
   const model = getModel();
   const allSamples = [];
   const sampleRows = [];
   let totalSignals = 0, totalWins = 0, sumR = 0;
   const now = Date.now();
-  const H = tfs ?? { gatillo: "15m", medio: "1h", mayor: "4h", msGatillo: 900000, msMedio: 3600000, msMayor: 14400000 };
-  // El horizonte rapido (5m) genera 3x mas velas: se limita a 90 dias para no reventar la descarga.
-  const effDays = H.gatillo === "5m" ? Math.min(days, 90) : days;
-  // Muestreo adaptativo: periodos largos evaluan con paso mayor para no congelar el telefono.
-  const step = effDays <= 90 ? 4 : effDays <= 180 ? 6 : 8;
 
-  // La META necesita la historia de BTC 4h para su filtro de sesgo.
+  const stratList = strategies ?? [strategy];
+  const multi = stratList.length > 1;
+  const DEFAULT_H = { gatillo: "15m", medio: "1h", mayor: "4h", msGatillo: 900000, msMedio: 3600000, msMayor: 14400000 };
+  const hzList = tfsList ?? [tfs ?? DEFAULT_H];
+  const total = hzList.length * symbols.length;
+  let done = 0;
+
+  // La META necesita la historia de BTC 4h (una sola descarga sirve para todos los horizontes).
   let btcSeries = null;
-  if (strategy === "meta") {
+  if (stratList.includes("meta")) {
     try {
-      const btc4h = await fetchHistory("BTCUSDT", "4h", now - effDays * 86400000 - 310 * H4);
+      const btc4h = await fetchHistory("BTCUSDT", "4h", now - days * 86400000 - 310 * H4);
       btcSeries = btcBiasSeries(btc4h);
     } catch { /* sin BTC: la META correra sin ese filtro y lo advierte */ }
   }
 
-  for (let si = 0; si < symbols.length; si++) {
-    const sym = symbols[si];
-    onProgress?.({ sym, done: si, total: symbols.length, fase: "descargando" });
-    let c15, c1h, c4h;
-    try {
-      const start = now - effDays * 86400000;
-      [c15, c1h, c4h] = await Promise.all([
-        fetchHistory(sym, H.gatillo, start - 310 * H.msGatillo),
-        fetchHistory(sym, H.medio, start - 310 * H.msMedio),
-        fetchHistory(sym, H.mayor, start - 310 * H.msMayor),
-      ]);
-    } catch { continue; }
-    if (!c15?.length || c15.length < 600) continue;
+  for (const H of hzList) {
+    // El horizonte rapido (5m) genera 3x mas velas: se limita a 90 dias.
+    const effDays = H.gatillo === "5m" ? Math.min(days, 90) : days;
+    // Muestreo adaptativo; con todas las estrategias el paso sube para compensar el computo x8.
+    const base = effDays <= 90 ? 4 : effDays <= 180 ? 6 : 8;
+    const step = multi ? base + 2 : base;
 
-    onProgress?.({ sym, done: si, total: symbols.length, fase: "evaluando" });
-    await new Promise((r) => setTimeout(r, 0)); // cede el hilo a la UI
-    const recs = backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, {
-      btcSeries, step, msMedio: H.msMedio, msMayor: H.msMayor, tfLabel: H.gatillo,
-    });
+    for (let si = 0; si < symbols.length; si++) {
+      const sym = symbols[si];
+      onProgress?.({ sym, done, total, fase: "descargando", tf: H.gatillo });
+      let c15, c1h, c4h;
+      try {
+        const start = now - effDays * 86400000;
+        [c15, c1h, c4h] = await Promise.all([
+          fetchHistory(sym, H.gatillo, start - 310 * H.msGatillo),
+          fetchHistory(sym, H.medio, start - 310 * H.msMedio),
+          fetchHistory(sym, H.mayor, start - 310 * H.msMayor),
+        ]);
+      } catch { done++; continue; }
+      if (!c15?.length || c15.length < 600) { done++; continue; }
 
-    for (const rec of recs) {
-      const win = rec.r > 0 ? 1 : 0;
-      addToBuckets(buckets, rec.segKeys, win);
-      const ageDays = (now - rec.ts) / 86400000;
-      // Peso por recencia relativo al periodo: lo viejo ensena menos, pero nunca menos de 0.3.
-      allSamples.push({ x: rec.x, y: win, weight: Math.max(0.3, 1 - ageDays / (days * 2)) });
-      sampleRows.push({
-        ts: rec.ts, symbol: rec.symbol, dir: rec.dir, modo: rec.modo,
-        confidence: rec.confidence, outcome: rec.outcome, r: rec.r,
-        detail: rec.detail, source: "backtest",
+      onProgress?.({ sym, done, total, fase: "evaluando", tf: H.gatillo });
+      const recs = await backtestSymbol(sym, c15, c1h, c4h, stratList, ind, riskMode, {
+        btcSeries, step, msMedio: H.msMedio, msMayor: H.msMayor, tfLabel: H.gatillo,
       });
-      totalSignals++; totalWins += win; sumR += rec.r;
+
+      for (const rec of recs) {
+        const win = rec.r > 0 ? 1 : 0;
+        addToBuckets(buckets, rec.segKeys, win);
+        const ageDays = (now - rec.ts) / 86400000;
+        // Peso por recencia relativo al periodo: lo viejo ensena menos, pero nunca menos de 0.3.
+        allSamples.push({ x: rec.x, y: win, weight: Math.max(0.3, 1 - ageDays / (days * 2)) });
+        sampleRows.push({
+          ts: rec.ts, symbol: rec.symbol, dir: rec.dir, modo: rec.modo, tf: rec.tf,
+          confidence: rec.confidence, outcome: rec.outcome, r: rec.r,
+          detail: rec.detail, source: "backtest",
+        });
+        totalSignals++; totalWins += win; sumR += rec.r;
+      }
+      done++;
+      await new Promise((r) => setTimeout(r, 200)); // respiro para la API y la UI
     }
-    await new Promise((r) => setTimeout(r, 200)); // respiro para la API y la UI
   }
 
   trainBatch(model, allSamples, 3);
@@ -386,13 +410,15 @@ export async function runBacktest({ symbols, strategy, ind, riskMode, days = 90,
   sampleRows.sort((a, b) => b.ts - a.ts);
   save(K_BTSAMPLE, sampleRows.slice(0, MAX_BTSAMPLE));
   const meta = {
-    ranAt: now, days: effDays, strategy, riskMode, tf: H.gatillo,
+    ranAt: now, days, riskMode,
+    strategy: multi ? `todas (${stratList.length})` : stratList[0],
+    tf: hzList.map((h) => h.gatillo).join("+"),
     symbols: symbols.length, signals: totalSignals,
     wins: totalWins, winRate: totalSignals ? totalWins / totalSignals : 0,
     avgR: totalSignals ? sumR / totalSignals : 0,
   };
   save(K_BTMETA, meta);
-  onProgress?.({ sym: null, done: symbols.length, total: symbols.length, fase: "listo" });
+  onProgress?.({ sym: null, done: total, total, fase: "listo" });
   return meta;
 }
 
