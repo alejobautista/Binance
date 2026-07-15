@@ -7,6 +7,45 @@ import {
 } from "./tracker.js";
 
 /* ---------- UI helpers ---------- */
+const C = {
+  bg: "#0a0e17", panel: "#111827", panel2: "#0d1420", border: "#1f2937",
+  text: "#e5e7eb", dim: "#6b7280", green: "#00d4aa", red: "#ff4d6d", amber: "#fbbf24", accent: "#3b82f6",
+};
+
+const HELP = {
+  senal: "La senal sale de la estrategia activa. INDICADORES: cada indicador encendido vota alcista, bajista o neutro mirando la ultima vela cerrada de 15m; se necesita mayoria (2/3 de los activos) en la misma direccion. ESTRUCTURA: se opera el ultimo BOS o CHoCH reciente. Despues pasan los filtros de riesgo (sesgo 4h/1h, sobreextension, recorrido libre): si uno falla en modo ESTRICTO la senal se bloquea y aqui se dice cual fue. La confianza resume cuan unanime fue el voto y cuantas advertencias quedaron.",
+  prob: "Mide como les fue a senales PARECIDAS a esta en el pasado (misma estrategia, direccion, confianza, categoria de la moneda...). Combina dos calculos: un modelo de aprendizaje continuo que se ajusta con cada resultado nuevo, y el conteo real de ganadas/perdidas por segmento. n = cuantas senales respaldan el numero; con pocas muestras el numero vale poco. Las flechas muestran que factores suben o bajan la probabilidad de ESTA senal.",
+  nucleo: "Como vota cada indicador sobre la ultima vela CERRADA de 15m: EMAs 9/21 = direccion de corto plazo (cruce alcista/bajista confirmado al cierre). RSI = fuerza; >55 alcista, <45 bajista, y en extremos frena: >70 bloquea largos (perseguir sobrecompra), <30 bloquea cortos. MACD = momentum (linea vs senal). Bollinger = posicion vs banda media, y en las bandas exteriores avisa sobreextension. La entrada requiere mayoria de votos en una direccion.",
+  contexto: "Informacion que ayuda a leer la situacion pero NO vota: el volumen valida rupturas (una ruptura sin volumen es sospechosa de trampa) y el soporte/resistencia son los extremos de las ultimas 30 velas, que el motor usa para colocar el stop y medir el recorrido libre.",
+  pivotes: "Un pivote es un maximo o minimo local que se confirma 3 velas despues de formarse (por eso no repinta). Se etiqueta comparando con el pivote anterior del mismo tipo: HH = maximo mas alto y HL = minimo mas alto (estructura alcista); LH = maximo mas bajo y LL = minimo mas bajo (estructura bajista). 'Roto' = el precio ya cerro mas alla de ese nivel.",
+  eventos: "BOS (Break of Structure) = el cierre rompe el ultimo swing A FAVOR de la tendencia: continuacion. CHoCH (Change of Character) = rompe EN CONTRA (ej.: venia bajista con LH/LL y cierra sobre el ultimo LH): posible giro. Solo se opera si el evento es reciente (menos de 12 velas) y, en estricto, si la estructura de 1h no lo contradice. El stop va al otro lado del swing vigente.",
+  tabla: "La misma foto en tres marcos temporales: 4h y 1h definen el sesgo mayor (en estricto no se opera contra el), 15m da el gatillo de entrada. EMA en verde = el precio esta por encima (alcista). ATR = cuanto se mueve una vela tipica; con el se coloca el stop y se detecta sobreextension.",
+  niveles: "El stop va donde la senal queda invalidada: 1.8 ATR o el soporte/swing (lo que quede mas lejos), nunca un numero magico. Los TP son escalonados (40% a 1R, 35% a 1.8R, 25% a 3R): aseguras ganancia y dejas correr el resto; tras TP1 el stop sube a break-even y la operacion ya no puede perder. Recorrido libre = espacio hasta el proximo obstaculo estructural; si es <1.5R el premio no justifica el riesgo. Apalancamiento maximo seguro = el mayor que deja la liquidacion MAS ALLA del stop.",
+  tamano: "Regla de oro de gestion de riesgo: arriesgar solo 1-2% del capital por operacion. El tamano sale de ahi: riesgo maximo en USDT dividido por la distancia al stop. Asi, 5 perdidas seguidas cuestan menos del 10% de la cuenta y sigues operando.",
+  mipos: "Si entraste con otro precio, otro monto u otro apalancamiento (o ya estabas dentro cuando salio la senal), escribelo aqui: se recalculan TUS ratios reales - cuanto pierdes si toca el stop, cuanto ganas en cada TP, tu R/B ponderado y donde queda TU liquidacion. El plan sugerido no cambia: esto compara tu ejecucion contra el plan.",
+};
+
+function Help({ k }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button onClick={() => setOpen((o) => !o)} style={{
+        background: open ? C.accent : "transparent", border: `1px solid ${open ? C.accent : C.border}`,
+        color: open ? "#fff" : C.dim, borderRadius: 8, padding: "0 7px", marginLeft: 8,
+        cursor: "pointer", fontSize: 10, fontFamily: "inherit", lineHeight: "15px", verticalAlign: "middle",
+      }}>{open ? "cerrar" : "¿?"}</button>
+      {open && (
+        <div style={{
+          marginTop: 8, padding: 10, background: C.panel2,
+          border: `1px dashed ${C.border}`, borderRadius: 4,
+          color: "#9aa4b2", fontSize: 11, lineHeight: 1.6, fontWeight: 400,
+          letterSpacing: "normal", textTransform: "none", whiteSpace: "normal",
+        }}>{HELP[k]}</div>
+      )}
+    </>
+  );
+}
+
 const Dot = ({ d }) => (
   <span style={{
     display: "inline-block", width: 7, height: 7, borderRadius: 2, marginRight: 8, flexShrink: 0,
@@ -248,6 +287,44 @@ export default function BinanceCopiloto() {
     return { bias, price: btc.close, rsi: btc.rsi };
   }, [market]);
 
+  // MI POSICION: la operacion real del usuario (entrada, margen y apalancamiento propios).
+  const [myEntry, setMyEntry] = useState("");
+  const [myMargin, setMyMargin] = useState("");
+  const [myLev, setMyLev] = useState("");
+
+  // Prellenar con la sugerencia cuando aparece una senal nueva (otro par/direccion/estrategia).
+  useEffect(() => {
+    if (analysis?.dir && analysis.entry) {
+      setMyEntry(String(analysis.entry));
+      setMyLev(String(analysis.maxLev ?? 1));
+    }
+  }, [analysis?.symbol, analysis?.dir, analysis?.modo]);
+
+  const myPos = useMemo(() => {
+    if (!analysis?.dir || !analysis.stop || !analysis.tps?.length) return null;
+    const e = parseFloat(myEntry), m = parseFloat(myMargin), L = parseFloat(myLev);
+    if (!(e > 0) || !(m > 0) || !(L > 0)) return null;
+    const isLong = analysis.dir === "long";
+    const size = m * L;
+    const riskPct = isLong ? (e - analysis.stop) / e : (analysis.stop - e) / e;
+    if (riskPct <= 0) return { invalid: true };
+    const tps = analysis.tps.map((tp) => {
+      const gainPct = isLong ? (tp.price - e) / e : (e - tp.price) / e;
+      return { ...tp, rReal: gainPct / riskPct, pnl: size * gainPct * (tp.pct / 100) };
+    });
+    const liqPrice = isLong ? e * (1 - 1 / L) : e * (1 + 1 / L);
+    return {
+      size, coins: size / e, riskPct,
+      riskUsdt: size * riskPct,
+      tps,
+      pnlTotal: tps.reduce((a, t) => a + t.pnl, 0),
+      weightedR: tps.reduce((a, t) => a + (t.pct / 100) * t.rReal, 0),
+      liqPrice,
+      liqSafe: isLong ? liqPrice < analysis.stop : liqPrice > analysis.stop,
+      slipPct: ((isLong ? e - analysis.entry : analysis.entry - e) / analysis.entry) * 100,
+    };
+  }, [analysis, myEntry, myMargin, myLev]);
+
   const position = useMemo(() => {
     if (!analysis?.dir || !analysis.entry || !analysis.stop) return null;
     const riskUsdt = capital * (riskPct / 100);
@@ -328,10 +405,6 @@ export default function BinanceCopiloto() {
   }, [trackerTick, tab]);
 
   /* ---------- Estilos ---------- */
-  const C = {
-    bg: "#0a0e17", panel: "#111827", panel2: "#0d1420", border: "#1f2937",
-    text: "#e5e7eb", dim: "#6b7280", green: "#00d4aa", red: "#ff4d6d", amber: "#fbbf24", accent: "#3b82f6",
-  };
   const sigColor = analysis?.signal === "LARGO" ? C.green : analysis?.signal === "CORTO" ? C.red : C.dim;
   const inputS = {
     background: C.panel2, border: `1px solid ${C.border}`, color: C.text,
@@ -686,6 +759,7 @@ export default function BinanceCopiloto() {
                     )}
                   </div>
                 </div>
+                <div style={{ marginTop: 10, fontSize: 10 }}><Help k="senal" /></div>
               </div>
 
               {analysis.dir && prob && (
@@ -694,7 +768,7 @@ export default function BinanceCopiloto() {
                   borderRadius: 4, padding: 14, marginBottom: 14,
                 }}>
                   <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 8 }}>
-                    PROBABILIDAD HISTORICA (motor de aprendizaje)
+                    PROBABILIDAD HISTORICA (motor de aprendizaje)<Help k="prob" />
                   </div>
                   <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 12, alignItems: "center" }}>
                     <div>
@@ -843,7 +917,7 @@ export default function BinanceCopiloto() {
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 14, marginBottom: 14 }}>
                   <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
                     <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 10 }}>
-                      INDICADORES ACTIVOS - 15m cerrado (deciden la entrada)
+                      INDICADORES ACTIVOS - 15m cerrado (deciden la entrada)<Help k="nucleo" />
                     </div>
                     {analysis.core.length === 0 && (
                       <div style={{ color: C.dim, fontSize: 12 }}>Todos los indicadores estan apagados.</div>
@@ -861,7 +935,7 @@ export default function BinanceCopiloto() {
                   </div>
                   <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
                     <div style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginBottom: 10 }}>
-                      CONTEXTO (informativo, no vota)
+                      CONTEXTO (informativo, no vota)<Help k="contexto" />
                     </div>
                     {analysis.contexto.map((c, i) => (
                       <div key={i} style={{
@@ -879,7 +953,7 @@ export default function BinanceCopiloto() {
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 14, marginBottom: 14 }}>
                   <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
                     <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 10 }}>
-                      PIVOTES 15m - confirmados 3 velas despues (sin repintado)
+                      PIVOTES 15m - confirmados 3 velas despues (sin repintado)<Help k="pivotes" />
                     </div>
                     {analysis.structure.seq.slice(-7).map((p, i) => (
                       <div key={i} style={{
@@ -900,7 +974,7 @@ export default function BinanceCopiloto() {
                   </div>
                   <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
                     <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 10 }}>
-                      EVENTOS - BOS (continuacion) / CHoCH (giro)
+                      EVENTOS - BOS (continuacion) / CHoCH (giro)<Help k="eventos" />
                     </div>
                     {analysis.structure.events.slice(-5).reverse().map((ev, i) => (
                       <div key={i} style={{
@@ -930,6 +1004,9 @@ export default function BinanceCopiloto() {
               )}
 
               <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, overflow: "auto", marginBottom: 14 }}>
+                <div style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", padding: "10px 12px 8px" }}>
+                  MULTI-TIMEFRAME (4h/1h = sesgo · 15m = gatillo)<Help k="tabla" />
+                </div>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                   <thead>
                     <tr style={{ background: C.panel2 }}>
@@ -961,7 +1038,7 @@ export default function BinanceCopiloto() {
               {analysis.dir ? (
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(300px,1fr))", gap: 14 }}>
                   <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
-                    <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 12 }}>NIVELES DEL SETUP</div>
+                    <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 12 }}>NIVELES DEL SETUP<Help k="niveles" /></div>
                     {[
                       ["Zona de entrada", `${fmt(analysis.zone[0])} - ${fmt(analysis.zone[1])}`, C.text],
                       ["Stop-loss", fmt(analysis.stop), C.red],
@@ -996,7 +1073,7 @@ export default function BinanceCopiloto() {
                   </div>
 
                   <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
-                    <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 12 }}>TAMANO DE POSICION</div>
+                    <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 12 }}>TAMANO DE POSICION (sugerido)<Help k="tamano" /></div>
                     <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
                       <div style={{ flex: 1 }}>
                         <div style={{ color: C.dim, fontSize: 10, marginBottom: 4 }}>CAPITAL (USDT)</div>
@@ -1041,6 +1118,103 @@ export default function BinanceCopiloto() {
                         <div style={{ marginTop: 8, fontSize: 10, color: C.dim, lineHeight: 1.5 }}>
                           Liquidacion aproximada - no incluye comisiones, funding ni margen de mantenimiento.
                           Usa el menor entre este apalancamiento y el limite de tu cuenta. Verifica en Binance.
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  <div style={{ background: C.panel, border: `1px solid ${C.accent}`, borderRadius: 4, padding: 14 }}>
+                    <div style={{ color: C.accent, fontSize: 10, letterSpacing: "0.1em", marginBottom: 12 }}>
+                      MI POSICION REAL (ajustala a tu operacion)<Help k="mipos" />
+                    </div>
+                    <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+                      <div style={{ flex: "1 1 100px" }}>
+                        <div style={{ color: C.dim, fontSize: 10, marginBottom: 4 }}>MI ENTRADA</div>
+                        <input type="number" value={myEntry} onChange={(e) => setMyEntry(e.target.value)} style={{ ...inputS, width: "100%" }} />
+                      </div>
+                      <div style={{ flex: "1 1 100px" }}>
+                        <div style={{ color: C.dim, fontSize: 10, marginBottom: 4 }}>MARGEN (USDT)</div>
+                        <input type="number" value={myMargin} onChange={(e) => setMyMargin(e.target.value)} placeholder="ej. 100" style={{ ...inputS, width: "100%" }} />
+                      </div>
+                      <div style={{ flex: "1 1 80px" }}>
+                        <div style={{ color: C.dim, fontSize: 10, marginBottom: 4 }}>APALANC. (x)</div>
+                        <input type="number" value={myLev} onChange={(e) => setMyLev(e.target.value)} style={{ ...inputS, width: "100%" }} />
+                      </div>
+                    </div>
+
+                    {!myPos && (
+                      <div style={{ color: C.dim, fontSize: 12, lineHeight: 1.6 }}>
+                        Escribe el margen con el que entraste (o vas a entrar) y se calculan TUS numeros.
+                        Si ya estabas dentro de la posicion, cambia "MI ENTRADA" por tu precio real de compra.
+                      </div>
+                    )}
+
+                    {myPos?.invalid && (
+                      <div style={{
+                        padding: 10, background: "#2d1215", border: `1px solid ${C.red}`,
+                        borderRadius: 4, fontSize: 11, lineHeight: 1.5, color: "#ffb3c0",
+                      }}>
+                        Tu entrada queda del lado equivocado del stop ({fmt(analysis.stop)}): desde ese precio
+                        el setup no aplica. Revisa el precio o espera un nuevo setup.
+                      </div>
+                    )}
+
+                    {myPos && !myPos.invalid && (
+                      <>
+                        {[
+                          ["Tamano de posicion", `${myPos.size.toFixed(2)} USDT`, C.text],
+                          ["Cantidad", `${myPos.coins.toFixed(4)} ${analysis.symbol.replace("USDT", "")}`, C.text],
+                          ["Si toca el stop", `-${myPos.riskUsdt.toFixed(2)} USDT (${(myPos.riskUsdt / (+myMargin) * 100).toFixed(0)}% de tu margen)`, C.red],
+                          ...myPos.tps.map((t, i) => [
+                            `TP${i + 1} (${t.pct}%)`,
+                            `${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)} USDT · ${t.rReal.toFixed(2)}R real`,
+                            t.pnl >= 0 ? C.green : C.red,
+                          ]),
+                          ["Si llena TP1-TP3", `${myPos.pnlTotal >= 0 ? "+" : ""}${myPos.pnlTotal.toFixed(2)} USDT`, myPos.pnlTotal >= 0 ? C.green : C.red],
+                          ["R/B ponderado real", `1:${myPos.weightedR.toFixed(2)} (plan sugerido: 1:1.78)`, myPos.weightedR >= 1.5 ? C.green : C.amber],
+                          ["Tu liquidacion aprox.", fmt(myPos.liqPrice), myPos.liqSafe ? C.green : C.red],
+                          ["Apalanc. max. seguro", `${analysis.maxLev}x (tu: ${(+myLev).toFixed(0)}x)`, +myLev <= analysis.maxLev ? C.green : C.red],
+                        ].map(([k, v, col], i) => (
+                          <div key={i} style={{
+                            display: "flex", justifyContent: "space-between", padding: "6px 0", gap: 10,
+                            borderTop: i ? `1px solid ${C.border}` : "none", fontSize: 12,
+                          }}>
+                            <span style={{ color: C.dim, flexShrink: 0 }}>{k}</span>
+                            <span style={{ color: col, fontWeight: 600, textAlign: "right" }}>{v}</span>
+                          </div>
+                        ))}
+
+                        {!myPos.liqSafe && (
+                          <div style={{
+                            marginTop: 10, padding: 10, background: "#2d1215", border: `1px solid ${C.red}`,
+                            borderRadius: 4, fontSize: 11, lineHeight: 1.5, color: "#ffb3c0",
+                          }}>
+                            PELIGRO: con {(+myLev).toFixed(0)}x tu liquidacion ({fmt(myPos.liqPrice)}) queda ANTES
+                            del stop ({fmt(analysis.stop)}): perderias TODO el margen antes de que el stop te proteja.
+                            Baja el apalancamiento a maximo {analysis.maxLev}x.
+                          </div>
+                        )}
+                        {myPos.liqSafe && +myLev > analysis.maxLev && (
+                          <div style={{ marginTop: 10, fontSize: 11, color: C.amber, lineHeight: 1.5 }}>
+                            ⚠ Usas mas apalancamiento que el maximo seguro sugerido ({analysis.maxLev}x). La liquidacion
+                            aun queda tras el stop, pero con poco margen para mechas y comisiones.
+                          </div>
+                        )}
+                        {Math.abs(myPos.slipPct) > 0.3 && (
+                          <div style={{ marginTop: 8, fontSize: 11, color: myPos.slipPct > 0 ? C.amber : C.green, lineHeight: 1.5 }}>
+                            {myPos.slipPct > 0
+                              ? `⚠ Tu entrada es ${myPos.slipPct.toFixed(2)}% peor que la sugerida (${fmt(analysis.entry)}): el stop te queda mas lejos y por eso tu R/B real baja.`
+                              : `✓ Tu entrada es ${Math.abs(myPos.slipPct).toFixed(2)}% mejor que la sugerida: tu R/B real mejora.`}
+                          </div>
+                        )}
+                        {myPos.riskUsdt > capital * 0.02 && (
+                          <div style={{ marginTop: 8, fontSize: 11, color: C.amber, lineHeight: 1.5 }}>
+                            ⚠ Este stop costaria {((myPos.riskUsdt / capital) * 100).toFixed(1)}% de tu capital
+                            ({capital} USDT): por encima del 2% recomendado. Considera reducir margen o apalancamiento.
+                          </div>
+                        )}
+                        <div style={{ marginTop: 8, fontSize: 11, color: C.amber, lineHeight: 1.5 }}>
+                          Tras TP1: mueve tu stop a TU break-even ({fmt(parseFloat(myEntry))}).
                         </div>
                       </>
                     )}
