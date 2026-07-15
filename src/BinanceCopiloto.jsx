@@ -58,6 +58,71 @@ function Help({ k }) {
   );
 }
 
+/* ---------- Lecturas dinamicas: interpretan LOS DATOS actuales, no la mecanica ---------- */
+const Lectura = ({ children }) => (
+  <div style={{
+    marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.border}`,
+    fontSize: 11, lineHeight: 1.65, color: "#c9d2dd",
+  }}>
+    <span style={{ color: C.amber, fontWeight: 700 }}>► Lectura: </span>{children}
+  </div>
+);
+
+function lecturaTF(a) {
+  const reg = (t, lbl) => {
+    const dir = t.ema50 && t.ema200
+      ? t.close > t.ema50 && t.ema50 > t.ema200 ? "ALCISTA"
+        : t.close < t.ema50 && t.ema50 < t.ema200 ? "BAJISTA" : "mixto"
+      : "sin datos";
+    const rsi = t.rsi != null ? ` (RSI ${t.rsi.toFixed(0)}: ${t.rsi > 55 ? "compradores" : t.rsi < 45 ? "vendedores" : "neutro"})` : "";
+    return `${lbl} ${dir}${rsi}`;
+  };
+  const partes = `${reg(a.tf4h, "4h")} · ${reg(a.tf1h, "1h")} · ${reg(a.tf15, "15m")}`;
+  const concl = a.bias === "ALCISTA"
+    ? "Las temporalidades mayores RESPALDAN los largos; operar cortos aqui es ir contra la corriente (el motor los veta en estricto y la META exige mas llaves)."
+    : a.bias === "BAJISTA"
+      ? "Las temporalidades mayores RESPALDAN los cortos; los largos van contra la corriente."
+      : "4h y 1h no se ponen de acuerdo: mercado en RANGO. Ninguna direccion tiene el viento a favor, asi que solo los setups de mayor calidad valen la pena.";
+  return `${partes}. ${concl}`;
+}
+
+function lecturaProb(prob) {
+  if (prob.insuficiente) {
+    return `Solo hay ${prob.n} senales parecidas resueltas: este numero AUN NO es confiable. Corre el backtest en Record; mientras tanto trata la probabilidad como desconocida, no como 50%.`;
+  }
+  const base = `De ${prob.n} senales parecidas, gano cerca del ${(prob.pBuckets * 100).toFixed(0)}%; el modelo continuo, ponderando los factores de ESTA senal, estima ${(prob.pModel * 100).toFixed(0)}%.`;
+  const juicio = prob.p >= 0.55
+    ? "El historial juega A FAVOR de esta senal."
+    : prob.p <= 0.45
+      ? "El historial juega EN CONTRA: setups como este han perdido mas de lo que ganaron."
+      : "El historial dice moneda al aire: si entras, que sea por la estructura del setup, no por la probabilidad.";
+  const div = prob.divergente ? " OJO: el modelo y el conteo divergen bastante - toma el numero con escepticismo extra." : "";
+  return `${base} ${juicio}${div}`;
+}
+
+function lecturaNiveles(a) {
+  const stopPct = ((Math.abs(a.entry - a.stop) / a.entry) * 100).toFixed(2);
+  const room = a.roomR != null
+    ? `El obstaculo mas cercano en contra esta a ${a.roomR.toFixed(1)}R (${fmt(a.ceiling)}): ${a.roomR >= 2.5 ? "espacio comodo para la escalera de TPs" : "espacio justo - considera asegurar ganancia antes de ese nivel"}.`
+    : "No hay obstaculo estructural cercano en contra.";
+  return `Arriesgas ${stopPct}% del precio. Si toca ${fmt(a.stop)} pierdes 1R y se acabo; si llena la escalera completa ganas 1.78R netos. Tras tocar TP1 (${fmt(a.tps[0]?.price)}) el stop sube a tu entrada y la operacion ya no puede perder. ${room}`;
+}
+
+function lecturaSenal(a) {
+  if (!a.dir) return null;
+  const d = a.dir === "long" ? "LARGO" : "CORTO";
+  if (a.modo === "indicadores") {
+    return `Se abre ${d} porque ${a.dir === "long" ? a.bull : a.bear} de ${a.nEnabled} indicadores activos apuntan en esa direccion (minimo ${a.needed}) y ningun filtro de riesgo lo bloqueo.`;
+  }
+  if (a.modo === "estructura") {
+    return `Se abre ${d} por el ${a.lastEvent?.type} de hace ${a.lastEvent?.age} velas: el cierre rompio ${fmt(a.lastEvent?.level)} y la estructura respalda continuar en esa direccion.`;
+  }
+  if (a.modo === "meta") {
+    return `Se abre ${d} porque la candidata de ${a.metaFuente} sobrevivio a los 5 filtros${a.metaConsenso >= 2 ? ` y ${a.metaConsenso} estrategias coinciden en la direccion` : ""}${a.metaProb?.n >= 30 ? `, con ${(a.metaProb.p * 100).toFixed(0)}% de probabilidad historica (n=${a.metaProb.n})` : ""}.`;
+  }
+  return `Se abre ${d} porque las condiciones de ${a.modo} listadas arriba se cumplieron al cierre de la vela de 15m; si hay advertencias, aparecen mas abajo y ya degradaron la confianza.`;
+}
+
 const Dot = ({ d }) => (
   <span style={{
     display: "inline-block", width: 7, height: 7, borderRadius: 2, marginRight: 8, flexShrink: 0,
@@ -873,6 +938,16 @@ export default function BinanceCopiloto() {
             ))}
           </div>
 
+          <div style={{
+            padding: "8px 12px", border: `1px dashed ${C.border}`, borderRadius: 4,
+            marginBottom: 16, fontSize: 11, color: C.dim, lineHeight: 1.6,
+          }}>
+            <span style={{ color: C.amber }}>TEMPORALIDAD:</span> senales INTRADIA — el gatillo es la vela
+            CERRADA de 15m, pero la direccion se valida siempre en 1h y 4h (y con BTC en la META): el 15m
+            nunca se opera aislado. Horizonte tipico de la operacion: 2 a 24 horas; tras TP1 el stop pasa a
+            break-even; a las 48h sin resolverse, expira. No es scalping de 1 minuto ni swing de semanas.
+          </div>
+
           {!analysis && !analyzing && (
             <div style={{ color: C.dim, padding: 40, textAlign: "center", border: `1px dashed ${C.border}`, borderRadius: 4 }}>
               Escribe un par o elige uno del escaner.
@@ -1027,11 +1102,7 @@ export default function BinanceCopiloto() {
                       </button>
                     )}
                   </div>
-                  {prob.insuficiente && (
-                    <div style={{ color: C.amber, fontSize: 11, marginTop: 8, lineHeight: 1.5 }}>
-                      Aun hay pocas muestras para confiar en este numero. Corre el backtest de 90 dias en la pestana Record para sembrar el historial.
-                    </div>
-                  )}
+                  <Lectura>{lecturaProb(prob)}</Lectura>
                 </div>
               )}
 
@@ -1164,6 +1235,7 @@ export default function BinanceCopiloto() {
                         <span style={{ fontSize: 12 }}>{c.v}</span>
                       </div>
                     ))}
+                    {analysis.dir && <Lectura>{lecturaSenal(analysis)}</Lectura>}
                   </div>
                   {analysis.contexto.length > 0 && (
                     <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
@@ -1233,6 +1305,7 @@ export default function BinanceCopiloto() {
                       <br />
                       Swing bajo vigente: {analysis.structure.lastL ? `${fmt(analysis.structure.lastL.price)} (${analysis.structure.lastL.label}${analysis.structure.lastL.broken ? ", roto" : ""})` : "-"}
                     </div>
+                    {analysis.dir && <Lectura>{lecturaSenal(analysis)}</Lectura>}
                   </div>
                 </div>
               )}
@@ -1267,6 +1340,9 @@ export default function BinanceCopiloto() {
                     ))}
                   </tbody>
                 </table>
+                <div style={{ padding: "0 12px 12px" }}>
+                  <Lectura>{lecturaTF(analysis)}</Lectura>
+                </div>
               </div>
 
               {analysis.dir ? (
@@ -1304,6 +1380,7 @@ export default function BinanceCopiloto() {
                     <div style={{ marginTop: 10, fontSize: 11, color: C.amber, lineHeight: 1.5 }}>
                       Tras TP1: mueve el stop a break-even ({fmt(analysis.entry)}).
                     </div>
+                    <Lectura>{lecturaNiveles(analysis)}</Lectura>
                   </div>
 
                   <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
