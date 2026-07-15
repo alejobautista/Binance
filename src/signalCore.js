@@ -32,10 +32,11 @@ export async function fetchCandles(sym, interval, limit = 300, opts = {}) {
 }
 
 // Descarga historico encadenando peticiones de 1000 velas desde startTime hasta hoy.
+// El tope de 60 tandas cubre holgado un anio de velas de 15m (~35k + margen).
 export async function fetchHistory(sym, interval, startTime) {
   const out = [];
   let cursor = startTime;
-  for (let guard = 0; guard < 40; guard++) {
+  for (let guard = 0; guard < 60; guard++) {
     const chunk = await fetchCandles(sym, interval, 1000, { startTime: cursor });
     if (!chunk.length) break;
     // evita duplicar la vela de empalme

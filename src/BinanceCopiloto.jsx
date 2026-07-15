@@ -435,6 +435,7 @@ export default function BinanceCopiloto() {
     }
   };
 
+  const [btDays, setBtDays] = useState(90);
   const doBacktest = async () => {
     if (btBusy) return;
     setBtBusy(true);
@@ -442,7 +443,7 @@ export default function BinanceCopiloto() {
     try {
       let syms = [...tickers].sort((a, b) => b.quoteVol - a.quoteVol).slice(0, 20).map((t) => t.symbol);
       if (!syms.length) syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"];
-      await runBacktest({ symbols: syms, strategy, ind, riskMode, days: 90, onProgress: setBtProg });
+      await runBacktest({ symbols: syms, strategy, ind, riskMode, days: btDays, onProgress: setBtProg });
       setTrackerTick((t) => t + 1);
     } catch (e) {
       setErr(`El backtest fallo: ${e.message}`);
@@ -1524,14 +1525,19 @@ export default function BinanceCopiloto() {
       {/* ============ RECORD ============ */}
       {tab === "record" && (
         <>
-          <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
             <button onClick={doVerify} style={btnS(C.accent, "#fff")}>VERIFICAR RESULTADOS</button>
             <button onClick={doBacktest} disabled={btBusy} style={{
               ...btnS(btBusy ? C.border : C.amber, btBusy ? C.dim : "#2d2000"),
               cursor: btBusy ? "wait" : "pointer",
             }}>
-              {btBusy ? "CORRIENDO BACKTEST..." : "BACKTEST 90 DIAS"}
+              {btBusy ? "CORRIENDO BACKTEST..." : `BACKTEST ${btDays} DIAS`}
             </button>
+            {[90, 180, 365].map((dd) => (
+              <button key={dd} onClick={() => setBtDays(dd)} disabled={btBusy} style={chipS(btDays === dd, "amber")}>
+                {dd === 365 ? "1 AÑO" : `${dd}D`}
+              </button>
+            ))}
             <button onClick={doExport} style={{ ...btnS("transparent", C.dim), border: `1px solid ${C.border}` }}>EXPORTAR</button>
             <button onClick={() => importRef.current?.click()} style={{ ...btnS("transparent", C.dim), border: `1px solid ${C.border}` }}>IMPORTAR</button>
             <input ref={importRef} type="file" accept="application/json" onChange={doImport} style={{ display: "none" }} />
@@ -1553,8 +1559,9 @@ export default function BinanceCopiloto() {
                 }} />
               </div>
               <div style={{ color: C.dim, fontSize: 11, marginTop: 8 }}>
-                Descarga 90 dias de velas por par y corre la estrategia "{strategy}" con tus filtros actuales.
-                Suele tardar 1-2 minutos. No cierres la pestana.
+                Descarga {btDays} dias de velas por par y corre la estrategia "{strategy}" con tus filtros actuales.
+                {btDays <= 90 ? " Suele tardar 1-2 minutos." : btDays <= 180 ? " Suele tardar 3-6 minutos." : " Un año tarda 8-15 minutos (35,000 velas por par); dejalo con la pantalla encendida."}
+                {" "}No cierres la pestana.
               </div>
             </div>
           )}

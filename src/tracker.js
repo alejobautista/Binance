@@ -234,13 +234,14 @@ export function stats() {
 const H15 = 900000, H1 = 3600000, H4 = 14400000;
 
 // Genera senales sobre historico y las resuelve. Solo computa; no toca storage.
+// `step` = cada cuantas velas de 15m se evalua (4 = cada hora).
 export function backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, opts = {}) {
-  const { btcSeries = null } = opts;
+  const { btcSeries = null, step = 4 } = opts;
   const out = [];
   let j1 = -1, j4 = -1;
   let blockLong = -1, blockShort = -1;
 
-  for (let i = 300; i < c15.length - 2; i += 4) {
+  for (let i = 300; i < c15.length - 2; i += step) {
     const decisionTime = c15[i + 1].time;
     while (j1 + 1 < c1h.length && c1h[j1 + 1].time + H1 <= decisionTime) j1++;
     while (j4 + 1 < c4h.length && c4h[j4 + 1].time + H4 <= decisionTime) j4++;
@@ -287,6 +288,8 @@ export async function runBacktest({ symbols, strategy, ind, riskMode, days = 90,
   const sampleRows = [];
   let totalSignals = 0, totalWins = 0, sumR = 0;
   const now = Date.now();
+  // Muestreo adaptativo: periodos largos evaluan con paso mayor para no congelar el telefono.
+  const step = days <= 90 ? 4 : days <= 180 ? 6 : 8;
 
   // La META necesita la historia de BTC 4h para su filtro de sesgo.
   let btcSeries = null;
@@ -313,13 +316,14 @@ export async function runBacktest({ symbols, strategy, ind, riskMode, days = 90,
 
     onProgress?.({ sym, done: si, total: symbols.length, fase: "evaluando" });
     await new Promise((r) => setTimeout(r, 0)); // cede el hilo a la UI
-    const recs = backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, { btcSeries });
+    const recs = backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, { btcSeries, step });
 
     for (const rec of recs) {
       const win = rec.r > 0 ? 1 : 0;
       addToBuckets(buckets, rec.segKeys, win);
       const ageDays = (now - rec.ts) / 86400000;
-      allSamples.push({ x: rec.x, y: win, weight: Math.max(0.3, 1 - ageDays / 180) });
+      // Peso por recencia relativo al periodo: lo viejo ensena menos, pero nunca menos de 0.3.
+      allSamples.push({ x: rec.x, y: win, weight: Math.max(0.3, 1 - ageDays / (days * 2)) });
       sampleRows.push({
         ts: rec.ts, symbol: rec.symbol, dir: rec.dir, modo: rec.modo,
         confidence: rec.confidence, outcome: rec.outcome, r: rec.r,
