@@ -1,0 +1,198 @@
+import React, { useMemo } from "react";
+import { ema, structureEngine, fmt, fmtQ } from "./signalCore.js";
+
+const COL = {
+  green: "#00d4aa", red: "#ff4d6d", amber: "#fbbf24", accent: "#3b82f6",
+  dim: "#6b7280", border: "#1f2937", text: "#e5e7eb",
+};
+
+/* Grafico de velas SVG: velas 15m cerradas + EMAs + pivotes + niveles del setup + muros. */
+export function CandleChart({ candles, sig, depthInfo }) {
+  const model = useMemo(() => {
+    if (!candles || candles.length < 30) return null;
+    const N = 96;
+    const data = candles.slice(-N);
+    const off = candles.length - data.length;
+    const closes = candles.map((c) => c.close);
+    const emas = [
+      { arr: ema(closes, 9), color: COL.amber },
+      { arr: ema(closes, 21), color: COL.accent },
+      { arr: ema(closes, 50), color: COL.dim },
+    ];
+    const st = structureEngine(candles);
+    const pivots = st.seq.filter((p) => p.i >= off && p.label !== "H" && p.label !== "L");
+
+    let lo = Math.min(...data.map((c) => c.low));
+    let hi = Math.max(...data.map((c) => c.high));
+    const range0 = hi - lo || 1;
+    // incluir niveles del setup si no quedan absurdamente lejos
+    const levels = [];
+    if (sig?.dir && sig.entry != null) {
+      levels.push({ p: sig.entry, label: "IN", color: COL.accent, dash: "" });
+      levels.push({ p: sig.stop, label: "SL", color: COL.red, dash: "5,4" });
+      (sig.tps ?? []).forEach((t, i) => levels.push({ p: t.price, label: `TP${i + 1}`, color: COL.green, dash: "5,4" }));
+    }
+    for (const l of levels) {
+      if (l.p > hi && l.p < hi + range0 * 0.6) hi = l.p;
+      if (l.p < lo && l.p > lo - range0 * 0.6) lo = l.p;
+    }
+    const pad = (hi - lo) * 0.05;
+    hi += pad; lo -= pad;
+
+    const walls = depthInfo
+      ? [...depthInfo.buyWalls.map((w) => ({ ...w, color: COL.green })),
+         ...depthInfo.sellWalls.map((w) => ({ ...w, color: COL.red }))]
+          .filter((w) => w.price > lo && w.price < hi)
+      : [];
+
+    return { data, off, emas, pivots, lo, hi, levels, walls };
+  }, [candles, sig, depthInfo]);
+
+  if (!model) return null;
+  const { data, off, emas, pivots, lo, hi, levels, walls } = model;
+
+  const W = 800, H = 320, VH = 42, PADT = 10, PADR = 74;
+  const plotH = H - VH - PADT - 6;
+  const X = (i) => ((i + 0.5) * (W - PADR)) / data.length;
+  const Y = (p) => PADT + ((hi - p) / (hi - lo)) * plotH;
+  const Yc = (p) => Math.max(PADT - 4, Math.min(PADT + plotH + 4, Y(p)));
+  const bw = Math.max(2, ((W - PADR) / data.length) * 0.62);
+  const maxVol = Math.max(...data.map((c) => c.volume)) || 1;
+
+  const linePath = (arr) => {
+    let d = "", pen = false;
+    for (let i = 0; i < data.length; i++) {
+      const v = arr[off + i];
+      if (v == null) { pen = false; continue; }
+      d += `${pen ? "L" : "M"}${X(i).toFixed(1)},${Yc(v).toFixed(1)}`;
+      pen = true;
+    }
+    return d;
+  };
+
+  const ticks = [0, 1, 2, 3].map((k) => lo + ((hi - lo) * k) / 3);
+  const tIdx = [0, Math.floor(data.length / 2), data.length - 1];
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+      {/* rejilla + escala de precio */}
+      {ticks.map((p, i) => (
+        <g key={i}>
+          <line x1={0} x2={W - PADR} y1={Y(p)} y2={Y(p)} stroke={COL.border} strokeWidth="1" />
+          <text x={W - PADR + 6} y={Y(p) + 3} fill={COL.dim} fontSize="11" fontFamily="inherit">{fmt(p)}</text>
+        </g>
+      ))}
+
+      {/* muros del libro */}
+      {walls.map((w, i) => (
+        <g key={`w${i}`}>
+          <line x1={0} x2={W - PADR} y1={Y(w.price)} y2={Y(w.price)} stroke={w.color} strokeWidth="4" opacity="0.18" />
+          <text x={4} y={Y(w.price) - 3} fill={w.color} fontSize="10" opacity="0.9" fontFamily="inherit">
+            muro {fmtQ(w.quote)}
+          </text>
+        </g>
+      ))}
+
+      {/* EMAs */}
+      {emas.map((e, i) => (
+        <path key={`e${i}`} d={linePath(e.arr)} fill="none" stroke={e.color} strokeWidth="1.4" opacity="0.85" />
+      ))}
+
+      {/* velas */}
+      {data.map((c, i) => {
+        const up = c.close >= c.open;
+        const col = up ? COL.green : COL.red;
+        const yO = Y(c.open), yC = Y(c.close);
+        return (
+          <g key={i}>
+            <line x1={X(i)} x2={X(i)} y1={Y(c.high)} y2={Y(c.low)} stroke={col} strokeWidth="1" />
+            <rect
+              x={X(i) - bw / 2} y={Math.min(yO, yC)}
+              width={bw} height={Math.max(1, Math.abs(yO - yC))}
+              fill={col}
+            />
+          </g>
+        );
+      })}
+
+      {/* pivotes HH/HL/LH/LL */}
+      {pivots.map((p, i) => {
+        const bull = p.label === "HH" || p.label === "HL";
+        const isHigh = p.kind === "H";
+        return (
+          <text key={`p${i}`} x={X(p.i - off)} y={isHigh ? Y(p.price) - 6 : Y(p.price) + 14}
+            fill={bull ? COL.green : COL.red} fontSize="10" fontWeight="700"
+            textAnchor="middle" fontFamily="inherit">
+            {p.label}
+          </text>
+        );
+      })}
+
+      {/* niveles del setup */}
+      {levels.map((l, i) => (
+        <g key={`l${i}`}>
+          <line x1={0} x2={W - PADR} y1={Y(l.p)} y2={Y(l.p)} stroke={l.color} strokeWidth="1.2"
+            strokeDasharray={l.dash} opacity="0.9" />
+          <text x={W - PADR + 6} y={Y(l.p) + 3} fill={l.color} fontSize="10" fontWeight="700" fontFamily="inherit">
+            {l.label} {fmt(l.p)}
+          </text>
+        </g>
+      ))}
+
+      {/* volumen coloreado por delta ejecutado */}
+      {data.map((c, i) => {
+        const frac = c.takerBuy != null && c.volume > 0 ? c.takerBuy / c.volume : (c.close >= c.open ? 0.6 : 0.4);
+        const h = (c.volume / maxVol) * VH;
+        return (
+          <rect key={`v${i}`} x={X(i) - bw / 2} y={H - 4 - h} width={bw} height={h}
+            fill={frac >= 0.5 ? COL.green : COL.red} opacity="0.45" />
+        );
+      })}
+
+      {/* etiquetas de tiempo */}
+      {tIdx.map((i) => (
+        <text key={`t${i}`} x={X(i)} y={H - VH - 12} fill={COL.dim} fontSize="10"
+          textAnchor="middle" fontFamily="inherit">
+          {new Date(data[i].time).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
+        </text>
+      ))}
+    </svg>
+  );
+}
+
+/* Curva de R acumulado: cada punto es una senal resuelta, en orden temporal. */
+export function EquityCurve({ series }) {
+  const model = useMemo(() => {
+    const valid = (series ?? []).filter((s) => s.points.length >= 2);
+    if (!valid.length) return null;
+    let mn = 0, mx = 0;
+    for (const s of valid) for (const v of s.points) { mn = Math.min(mn, v); mx = Math.max(mx, v); }
+    if (mx - mn < 1) { mx += 1; mn -= 1; }
+    const pad = (mx - mn) * 0.08;
+    return { valid, lo: mn - pad, hi: mx + pad };
+  }, [series]);
+
+  if (!model) return null;
+  const { valid, lo, hi } = model;
+  const W = 800, H = 200, PADR = 50, PADT = 8;
+  const Y = (v) => PADT + ((hi - v) / (hi - lo)) * (H - PADT * 2);
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+      {[lo + (hi - lo) * 0.15, 0, hi - (hi - lo) * 0.15].map((v, i) => (
+        <g key={i}>
+          <line x1={0} x2={W - PADR} y1={Y(v)} y2={Y(v)} stroke={COL.border} strokeWidth="1"
+            strokeDasharray={v === 0 ? "" : "3,4"} opacity={v === 0 ? 1 : 0.6} />
+          <text x={W - PADR + 6} y={Y(v) + 3} fill={COL.dim} fontSize="11" fontFamily="inherit">
+            {v >= 0 ? "+" : ""}{v.toFixed(1)}R
+          </text>
+        </g>
+      ))}
+      {valid.map((s, si) => {
+        const X = (i) => (i / (s.points.length - 1)) * (W - PADR);
+        const d = s.points.map((v, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join("");
+        return <path key={si} d={d} fill="none" stroke={s.color} strokeWidth="1.8" opacity="0.95" />;
+      })}
+    </svg>
+  );
+}

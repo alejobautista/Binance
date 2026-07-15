@@ -27,6 +27,7 @@ export async function fetchCandles(sym, interval, limit = 300, opts = {}) {
   const raw = await fetchJson(`/klines?symbol=${sym}&interval=${interval}&limit=${limit}${extra}`);
   return raw.map((c) => ({
     time: c[0], open: +c[1], high: +c[2], low: +c[3], close: +c[4], volume: +c[5],
+    takerBuy: c[9] != null ? +c[9] : null, // volumen EJECUTADO por compradores agresivos
   }));
 }
 
@@ -201,7 +202,18 @@ export function analyzeTF(candles) {
   const srLows = lows.slice(-33, -3);
   const srHighs = highs.slice(-33, -3);
 
+  // Delta de volumen EJECUTADO: fraccion comprada por agresores (taker buy / total).
+  let deltaLast = null, delta10 = null;
+  if (lastCandle.takerBuy != null) {
+    deltaLast = vols[n - 1] > 0 ? lastCandle.takerBuy / vols[n - 1] : 0.5;
+    const last10 = candles.slice(-10);
+    const v10 = last10.reduce((a, c) => a + c.volume, 0);
+    const b10 = last10.reduce((a, c) => a + (c.takerBuy ?? c.volume / 2), 0);
+    delta10 = v10 > 0 ? b10 / v10 : 0.5;
+  }
+
   return {
+    deltaLast, delta10,
     close: closes[n - 1],
     candleDir: lastCandle.close > lastCandle.open ? 1 : lastCandle.close < lastCandle.open ? -1 : 0,
     ema9: last(e9), ema21: last(e21), ema50: last(e50), ema200: last(e200),
@@ -425,6 +437,14 @@ export function buildIndicatorSignal(tf15, tf1h, tf4h, live, ind, riskMode) {
     contexto.push({ n: "Volumen", v: `${tf15.volRatio.toFixed(2)}x - seco; cualquier ruptura es sospechosa`, d: "flat" });
   } else {
     contexto.push({ n: "Volumen", v: `${tf15.volRatio.toFixed(2)}x la media - normal`, d: "flat" });
+  }
+  if (tf15.delta10 != null) {
+    const dL = tf15.deltaLast * 100, d10 = tf15.delta10 * 100;
+    contexto.push({
+      n: "Delta ejec.",
+      v: `${dL.toFixed(0)}% compra ultima vela · ${d10.toFixed(0)}% en 10 velas (volumen ejecutado, no fingible)`,
+      d: tf15.delta10 > 0.55 ? "up" : tf15.delta10 < 0.45 ? "down" : "flat",
+    });
   }
   const distSup = ((live - tf15.support) / live) * 100;
   const distRes = ((tf15.resistance - live) / live) * 100;

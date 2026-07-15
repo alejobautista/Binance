@@ -5,6 +5,7 @@ import {
   recordSignal, markTaken, getSignals, probability, resolveOpenSignals,
   stats as trackerStats, runBacktest, exportJSON, importJSON, clearAll, getBtSample,
 } from "./tracker.js";
+import { CandleChart, EquityCurve } from "./Chart.jsx";
 
 /* ---------- UI helpers ---------- */
 const C = {
@@ -23,6 +24,10 @@ const HELP = {
   niveles: "El stop va donde la senal queda invalidada: 1.8 ATR o el soporte/swing (lo que quede mas lejos), nunca un numero magico. Los TP son escalonados (40% a 1R, 35% a 1.8R, 25% a 3R): aseguras ganancia y dejas correr el resto; tras TP1 el stop sube a break-even y la operacion ya no puede perder. Recorrido libre = espacio hasta el proximo obstaculo estructural; si es <1.5R el premio no justifica el riesgo. Apalancamiento maximo seguro = el mayor que deja la liquidacion MAS ALLA del stop.",
   tamano: "Regla de oro de gestion de riesgo: arriesgar solo 1-2% del capital por operacion. El tamano sale de ahi: riesgo maximo en USDT dividido por la distancia al stop. Asi, 5 perdidas seguidas cuestan menos del 10% de la cuenta y sigues operando.",
   mipos: "Si entraste con otro precio, otro monto u otro apalancamiento (o ya estabas dentro cuando salio la senal), escribelo aqui: se recalculan TUS ratios reales - cuanto pierdes si toca el stop, cuanto ganas en cada TP, tu R/B ponderado y donde queda TU liquidacion. El plan sugerido no cambia: esto compara tu ejecucion contra el plan.",
+  chart: "Ultimas ~96 velas cerradas de 15m. Lineas: EMA9 (amarilla), EMA21 (azul), EMA50 (gris). Letras verdes/rojas = pivotes HH/HL (alcistas) y LH/LL (bajistas). Lineas punteadas = tu setup: IN entrada, SL stop, TP1-3 objetivos. Franjas translucidas = muros del libro de ordenes. Barras de abajo = volumen, coloreado por quien ejecuto mas (verde = compradores agresivos, rojo = vendedores).",
+  flujo: "A diferencia del libro (ordenes en espera, cancelables), esto es volumen YA EJECUTADO: que porcentaje de lo negociado fue comprado con ordenes de mercado (agresores). Mas del 55% sostenido = presion compradora real; menos del 45% = vendedora. No se puede fingir porque son operaciones cerradas.",
+  posiciones: "Tus senales marcadas con LA TOME que siguen abiertas. Muestra el precio actual contra la entrada registrada, el avance en R (1R = la distancia de tu stop) y te avisa cuando toca mover el stop a break-even. Los datos se resuelven definitivamente con VERIFICAR RESULTADOS.",
+  curva: "Cada punto es una senal resuelta, en orden temporal; la altura es la suma de R ganados/perdidos hasta ahi. Una curva que sube de forma sostenida = el motor tiene ventaja; una que baja o va plana = no la tiene (y la probabilidad te lo reflejara). La linea ambar es la muestra del backtest; la verde, senales en vivo.",
 };
 
 function Help({ k }) {
@@ -404,6 +409,43 @@ export default function BinanceCopiloto() {
     return [...live, ...bt].sort((a, b) => b.ts - a.ts).slice(0, 120);
   }, [trackerTick, tab]);
 
+  // Posiciones vivas: senales marcadas "la tome" que siguen abiertas.
+  const openTaken = useMemo(
+    () => getSignals().filter((s) => s.taken && s.outcome === "open"),
+    [trackerTick, tab]
+  );
+  const [posPx, setPosPx] = useState({});
+  const [posBusy, setPosBusy] = useState(false);
+  const refreshPositions = useCallback(async () => {
+    const syms = [...new Set(openTaken.map((s) => s.symbol))];
+    if (!syms.length || posBusy) return;
+    setPosBusy(true);
+    const out = {};
+    for (const sym of syms) {
+      try {
+        const d = await fetchJson(`/ticker/price?symbol=${sym}`);
+        out[sym] = parseFloat(d.price);
+      } catch { /* sin precio esta vez */ }
+    }
+    setPosPx(out);
+    setPosBusy(false);
+  }, [openTaken, posBusy]);
+
+  useEffect(() => {
+    if (tab === "record" && openTaken.length) refreshPositions();
+  }, [tab, openTaken.length]);
+
+  // Curva de R acumulado (cada punto = una senal resuelta, en orden temporal).
+  const curves = useMemo(() => {
+    const cum = (arr) => { let c = 0; return arr.map((s) => (c += s.r ?? 0)); };
+    const live = getSignals().filter((s) => s.outcome !== "open" && s.r != null).sort((a, b) => a.ts - b.ts);
+    const bt = getBtSample().filter((s) => s.r != null).sort((a, b) => a.ts - b.ts);
+    const series = [];
+    if (bt.length >= 2) series.push({ label: "backtest (muestra)", color: "#fbbf24", points: cum(bt) });
+    if (live.length >= 2) series.push({ label: "en vivo", color: "#00d4aa", points: cum(live) });
+    return series;
+  }, [trackerTick, tab]);
+
   /* ---------- Estilos ---------- */
   const sigColor = analysis?.signal === "LARGO" ? C.green : analysis?.signal === "CORTO" ? C.red : C.dim;
   const inputS = {
@@ -761,6 +803,39 @@ export default function BinanceCopiloto() {
                 </div>
                 <div style={{ marginTop: 10, fontSize: 10 }}><Help k="senal" /></div>
               </div>
+
+              {market && (
+                <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14, marginBottom: 14 }}>
+                  <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 8 }}>
+                    GRAFICO 15m - velas cerradas, pivotes y niveles<Help k="chart" />
+                  </div>
+                  <CandleChart candles={market.c15.slice(0, -1)} sig={analysis} depthInfo={depthInfo} />
+                  <div style={{ color: C.dim, fontSize: 10, marginTop: 6, lineHeight: 1.5 }}>
+                    <span style={{ color: C.amber }}>—</span> EMA9 · <span style={{ color: C.accent }}>—</span> EMA21 ·{" "}
+                    <span style={{ color: "#9aa4b2" }}>—</span> EMA50 · punteadas: IN/SL/TP · franjas: muros del libro ·
+                    volumen verde/rojo segun quien ejecuto mas.
+                  </div>
+                </div>
+              )}
+
+              {analysis.tf15.delta10 != null && (
+                <div style={{
+                  background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4,
+                  padding: "10px 14px", marginBottom: 14, fontSize: 12, color: C.dim,
+                }}>
+                  <span style={{ color: C.amber }}>FLUJO EJECUTADO</span>
+                  <Help k="flujo" />
+                  {" "}· ultima vela:{" "}
+                  <span style={{ color: analysis.tf15.deltaLast >= 0.55 ? C.green : analysis.tf15.deltaLast <= 0.45 ? C.red : C.text }}>
+                    {(analysis.tf15.deltaLast * 100).toFixed(0)}% compra
+                  </span>
+                  {" "}· ultimas 10 velas:{" "}
+                  <span style={{ color: analysis.tf15.delta10 >= 0.55 ? C.green : analysis.tf15.delta10 <= 0.45 ? C.red : C.text }}>
+                    {(analysis.tf15.delta10 * 100).toFixed(0)}% compra
+                  </span>
+                  {" "}— {analysis.tf15.delta10 >= 0.55 ? "los compradores estan ejecutando de verdad." : analysis.tf15.delta10 <= 0.45 ? "los vendedores estan ejecutando de verdad." : "flujo equilibrado."}
+                </div>
+              )}
 
               {analysis.dir && prob && (
                 <div style={{
@@ -1378,6 +1453,81 @@ export default function BinanceCopiloto() {
               </div>
             </div>
           </div>
+
+          {openTaken.length > 0 && (
+            <>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+                <div style={{ color: C.amber, fontSize: 11, letterSpacing: "0.1em" }}>
+                  MIS POSICIONES ABIERTAS ({openTaken.length})<Help k="posiciones" />
+                </div>
+                <button onClick={refreshPositions} disabled={posBusy} style={{
+                  background: "transparent", border: `1px solid ${C.accent}`, color: C.accent,
+                  padding: "4px 10px", borderRadius: 3, cursor: "pointer", fontSize: 10, fontFamily: "inherit",
+                }}>
+                  {posBusy ? "..." : "REFRESCAR PRECIOS"}
+                </button>
+              </div>
+              <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, overflow: "auto", marginBottom: 16 }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ background: C.panel2 }}>
+                      {["PAR", "DIR", "ENTRADA", "AHORA", "AVANCE", "ESTADO"].map((h) => (
+                        <th key={h} style={{ padding: "8px 12px", textAlign: "left", color: C.dim, fontSize: 10, fontWeight: 500 }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {openTaken.map((s) => {
+                      const px = posPx[s.symbol];
+                      const risk = Math.abs(s.entry - s.stop) || 1;
+                      const adv = px != null ? (s.dir === "long" ? px - s.entry : s.entry - px) / risk : null;
+                      const tp1 = s.tps?.[0]?.price;
+                      const hitTp1 = px != null && tp1 != null && (s.dir === "long" ? px >= tp1 : px <= tp1);
+                      const nearStop = adv != null && adv <= -0.7;
+                      return (
+                        <tr key={s.id} style={{ borderTop: `1px solid ${C.border}` }}>
+                          <td style={{ padding: "7px 12px", fontWeight: 600 }}>{s.symbol}</td>
+                          <td style={{ padding: "7px 12px", color: s.dir === "long" ? C.green : C.red }}>
+                            {s.dir === "long" ? "LARGO" : "CORTO"}
+                          </td>
+                          <td style={{ padding: "7px 12px" }}>{fmt(s.entry)}</td>
+                          <td style={{ padding: "7px 12px" }}>{px != null ? fmt(px) : "-"}</td>
+                          <td style={{ padding: "7px 12px", color: adv == null ? C.dim : adv >= 0 ? C.green : C.red }}>
+                            {adv != null ? `${adv >= 0 ? "+" : ""}${adv.toFixed(2)}R` : "-"}
+                          </td>
+                          <td style={{ padding: "7px 12px", fontSize: 11, color: hitTp1 ? C.green : nearStop ? C.red : C.dim }}>
+                            {adv == null ? "sin precio"
+                              : adv <= -1 ? "stop tocado? VERIFICAR RESULTADOS"
+                              : hitTp1 ? `TP1 alcanzado: mueve stop a BE (${fmt(s.entry)})`
+                              : nearStop ? `cerca del stop ${fmt(s.stop)}`
+                              : `stop ${fmt(s.stop)} · TP1 ${fmt(tp1)}`}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+
+          {curves.length > 0 && (
+            <>
+              <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
+                CURVA DE RESULTADOS - R ACUMULADO<Help k="curva" />
+              </div>
+              <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14, marginBottom: 16 }}>
+                <EquityCurve series={curves} />
+                <div style={{ color: C.dim, fontSize: 10, marginTop: 6 }}>
+                  {curves.map((c, i) => (
+                    <span key={i} style={{ marginRight: 14 }}>
+                      <span style={{ color: c.color }}>—</span> {c.label} ({c.points.length} senales, {c.points[c.points.length - 1] >= 0 ? "+" : ""}{c.points[c.points.length - 1].toFixed(1)}R)
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
 
           {recStats.rows.length > 0 && (
             <>
