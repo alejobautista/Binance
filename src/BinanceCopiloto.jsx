@@ -1,531 +1,12 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { fetchJson, fetchCandles, fmt, evaluate, analyzeTF } from "./signalCore.js";
+import { STABLES, assetCat, CAT_LABELS, SUBCAT_LABELS, subCat } from "./categories.js";
+import {
+  recordSignal, markTaken, getSignals, probability, resolveOpenSignals,
+  stats as trackerStats, runBacktest, exportJSON, importJSON, clearAll, getBtSample,
+} from "./tracker.js";
 
-const BASES = [
-  "https://api.binance.com/api/v3",
-  "https://data-api.binance.vision/api/v3",
-];
-
-async function fetchJson(path) {
-  let lastErr;
-  for (const b of BASES) {
-    try {
-      const res = await fetch(`${b}${path}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr;
-}
-
-const fmt = (n) => {
-  if (n == null || isNaN(n)) return "-";
-  if (n >= 1000) return n.toFixed(2);
-  if (n >= 1) return n.toFixed(4);
-  return n.toFixed(6);
-};
-
-/* ---------- INDICADORES ---------- */
-const ema = (data, period) => {
-  if (!data || data.length < period) return [];
-  const k = 2 / (period + 1);
-  const out = new Array(data.length).fill(null);
-  let sum = 0;
-  for (let i = 0; i < period; i++) sum += data[i];
-  out[period - 1] = sum / period;
-  for (let i = period; i < data.length; i++) out[i] = data[i] * k + out[i - 1] * (1 - k);
-  return out;
-};
-
-const sma = (data, period) => {
-  const out = new Array(data.length).fill(null);
-  for (let i = period - 1; i < data.length; i++) {
-    let s = 0;
-    for (let j = i - period + 1; j <= i; j++) s += data[j];
-    out[i] = s / period;
-  }
-  return out;
-};
-
-const rsi = (closes, period = 14) => {
-  if (closes.length < period + 1) return [];
-  const out = new Array(closes.length).fill(null);
-  let gain = 0, loss = 0;
-  for (let i = 1; i <= period; i++) {
-    const d = closes[i] - closes[i - 1];
-    if (d > 0) gain += d; else loss -= d;
-  }
-  let ag = gain / period, al = loss / period;
-  out[period] = al === 0 ? 100 : 100 - 100 / (1 + ag / al);
-  for (let i = period + 1; i < closes.length; i++) {
-    const d = closes[i] - closes[i - 1];
-    ag = (ag * (period - 1) + (d > 0 ? d : 0)) / period;
-    al = (al * (period - 1) + (d < 0 ? -d : 0)) / period;
-    out[i] = al === 0 ? 100 : 100 - 100 / (1 + ag / al);
-  }
-  return out;
-};
-
-const macd = (closes, fast = 12, slow = 26, sig = 9) => {
-  const ef = ema(closes, fast), es = ema(closes, slow);
-  const line = closes.map((_, i) => (ef[i] != null && es[i] != null ? ef[i] - es[i] : null));
-  const valid = line.filter((v) => v != null);
-  const sl = ema(valid, sig);
-  const offset = line.length - valid.length;
-  const signal = new Array(line.length).fill(null);
-  sl.forEach((v, i) => { if (v != null) signal[i + offset] = v; });
-  return { line, signal };
-};
-
-const atr = (highs, lows, closes, period = 14) => {
-  if (closes.length < period + 1) return [];
-  const tr = [null];
-  for (let i = 1; i < closes.length; i++) {
-    tr.push(Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1])));
-  }
-  const out = new Array(closes.length).fill(null);
-  let s = 0;
-  for (let i = 1; i <= period; i++) s += tr[i];
-  out[period] = s / period;
-  for (let i = period + 1; i < closes.length; i++) out[i] = (out[i - 1] * (period - 1) + tr[i]) / period;
-  return out;
-};
-
-const bollinger = (closes, period = 20, mult = 2) => {
-  const mid = sma(closes, period);
-  const upper = new Array(closes.length).fill(null);
-  const lower = new Array(closes.length).fill(null);
-  const width = new Array(closes.length).fill(null);
-  for (let i = period - 1; i < closes.length; i++) {
-    let s = 0;
-    for (let j = i - period + 1; j <= i; j++) s += (closes[j] - mid[i]) ** 2;
-    const sd = Math.sqrt(s / period);
-    upper[i] = mid[i] + mult * sd;
-    lower[i] = mid[i] - mult * sd;
-    width[i] = ((upper[i] - lower[i]) / mid[i]) * 100;
-  }
-  return { mid, upper, lower, width };
-};
-
-const last = (arr) => {
-  for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return arr[i];
-  return null;
-};
-
-/* ---------- ANALISIS POR TIMEFRAME ---------- */
-function analyzeTF(candles) {
-  const closes = candles.map((c) => c.close);
-  const highs = candles.map((c) => c.high);
-  const lows = candles.map((c) => c.low);
-  const vols = candles.map((c) => c.volume);
-  const n = closes.length;
-
-  const e9 = ema(closes, 9), e21 = ema(closes, 21), e50 = ema(closes, 50), e200 = ema(closes, 200);
-  const r = rsi(closes, 14), m = macd(closes), a = atr(highs, lows, closes, 14);
-  const bb = bollinger(closes);
-
-  const volAvg = vols.slice(-21, -1).reduce((x, y) => x + y, 0) / 20;
-  const lastCandle = candles[n - 1];
-  const srLows = lows.slice(-33, -3);
-  const srHighs = highs.slice(-33, -3);
-
-  return {
-    close: closes[n - 1],
-    candleDir: lastCandle.close > lastCandle.open ? 1 : lastCandle.close < lastCandle.open ? -1 : 0,
-    ema9: last(e9), ema21: last(e21), ema50: last(e50), ema200: last(e200),
-    rsi: last(r), macdLine: last(m.line), macdSignal: last(m.signal),
-    atr: last(a),
-    bbUpper: last(bb.upper), bbLower: last(bb.lower), bbMid: last(bb.mid), bbWidth: last(bb.width),
-    volRatio: volAvg > 0 ? vols[n - 1] / volAvg : 1,
-    support: Math.min(...srLows),
-    resistance: Math.max(...srHighs),
-  };
-}
-
-/* ---------- MOTOR DE ESTRUCTURA (HH/HL/LH/LL + BOS/CHoCH) ---------- */
-function structureEngine(candles, left = 3, right = 3) {
-  const n = candles.length;
-  const highs = candles.map((c) => c.high);
-  const lows = candles.map((c) => c.low);
-  const closes = candles.map((c) => c.close);
-
-  const rawPivots = [];
-  for (let i = left; i < n - right; i++) {
-    let isH = true, isL = true;
-    for (let j = i - left; j <= i + right; j++) {
-      if (j === i) continue;
-      if (highs[j] >= highs[i]) isH = false;
-      if (lows[j] <= lows[i]) isL = false;
-    }
-    if (isH) rawPivots.push({ i, price: highs[i], kind: "H", time: candles[i].time });
-    if (isL) rawPivots.push({ i, price: lows[i], kind: "L", time: candles[i].time });
-  }
-
-  // Un pivote solo se confirma `right` velas despues de formarse (sin repintado).
-  const byConfirm = new Map();
-  rawPivots.forEach((p) => {
-    const t = p.i + right;
-    if (!byConfirm.has(t)) byConfirm.set(t, []);
-    byConfirm.get(t).push(p);
-  });
-
-  let trend = 0; // 1 alcista, -1 bajista, 0 sin definir
-  let prevH = null, prevL = null, lastH = null, lastL = null;
-  const seq = [], events = [];
-  const BULL = new Set(["HH", "HL"]), BEAR = new Set(["LH", "LL"]);
-
-  for (let t = 0; t < n; t++) {
-    for (const p of byConfirm.get(t) || []) {
-      if (p.kind === "H") {
-        const label = prevH ? (p.price > prevH.price ? "HH" : "LH") : "H";
-        prevH = p;
-        lastH = { ...p, label, broken: false };
-        seq.push(lastH);
-      } else {
-        const label = prevL ? (p.price > prevL.price ? "HL" : "LL") : "L";
-        prevL = p;
-        lastL = { ...p, label, broken: false };
-        seq.push(lastL);
-      }
-      // Sin tendencia definida aun: sembrarla cuando dos pivotes seguidos apuntan igual,
-      // para que el primer rompimiento en contra cuente como CHoCH y no como BOS.
-      if (trend === 0 && seq.length >= 2) {
-        const a = seq[seq.length - 2].label, b = seq[seq.length - 1].label;
-        if (BULL.has(a) && BULL.has(b)) trend = 1;
-        else if (BEAR.has(a) && BEAR.has(b)) trend = -1;
-      }
-    }
-    const c = closes[t];
-    if (lastH && !lastH.broken && c > lastH.price) {
-      lastH.broken = true;
-      events.push({
-        t, time: candles[t].time, level: lastH.price, dir: "up",
-        type: trend === -1 ? "CHoCH+" : "BOS alcista",
-      });
-      trend = 1;
-    }
-    if (lastL && !lastL.broken && c < lastL.price) {
-      lastL.broken = true;
-      events.push({
-        t, time: candles[t].time, level: lastL.price, dir: "down",
-        type: trend === 1 ? "CHoCH-" : "BOS bajista",
-      });
-      trend = -1;
-    }
-  }
-
-  return { seq, events, trend, lastH, lastL, n };
-}
-
-/* ---------- NIVELES / GESTION (compartido) ---------- */
-function buildLevels(dir, live, A, stopPrice, tf15, tf1h, strict) {
-  const entry = live;
-  if (dir === "long") {
-    const stop = stopPrice;
-    const risk = entry - stop;
-    if (risk <= 0) return { blocked: true, reason: "Stop invalido: quedaria por encima del precio." };
-    const ceiling = [tf15.resistance, tf1h.resistance]
-      .filter((x) => x > entry * 1.001)
-      .sort((a, b) => a - b)[0] ?? null;
-    const roomR = ceiling ? (ceiling - entry) / risk : null;
-    let warning = null;
-    if (roomR !== null && roomR < 1.5) {
-      const reason = `Techo estructural en ${fmt(ceiling)} a solo ${roomR.toFixed(2)}R. No cumple el minimo 1:1.5 de recorrido libre.`;
-      if (strict) return { blocked: true, reason, roomR, ceiling };
-      warning = reason;
-    }
-    const stopPct = ((entry - stop) / entry) * 100;
-    return {
-      entry, zone: [live - 0.4 * A, live], stop, roomR, ceiling, warning,
-      tps: [
-        { pct: 40, price: entry + risk * 1.0, r: 1.0 },
-        { pct: 35, price: entry + risk * 1.8, r: 1.8 },
-        { pct: 25, price: entry + risk * 3.0, r: 3.0 },
-      ],
-      maxLev: Math.max(1, Math.min(10, Math.floor(100 / (stopPct * 1.6)))),
-      invalidation: `Cierre 15m bajo ${fmt(stop)} anula el setup.`,
-    };
-  }
-  const stop = stopPrice;
-  const risk = stop - entry;
-  if (risk <= 0) return { blocked: true, reason: "Stop invalido: quedaria por debajo del precio." };
-  const floor = [tf15.support, tf1h.support]
-    .filter((x) => x < entry * 0.999)
-    .sort((a, b) => b - a)[0] ?? null;
-  const roomR = floor ? (entry - floor) / risk : null;
-  let warning = null;
-  if (roomR !== null && roomR < 1.5) {
-    const reason = `Piso estructural en ${fmt(floor)} a solo ${roomR.toFixed(2)}R. No cumple el minimo 1:1.5 de recorrido libre.`;
-    if (strict) return { blocked: true, reason, roomR, ceiling: floor };
-    warning = reason;
-  }
-  const stopPct = ((stop - entry) / entry) * 100;
-  return {
-    entry, zone: [live, live + 0.4 * A], stop, roomR, ceiling: floor, warning,
-    tps: [
-      { pct: 40, price: entry - risk * 1.0, r: 1.0 },
-      { pct: 35, price: entry - risk * 1.8, r: 1.8 },
-      { pct: 25, price: entry - risk * 3.0, r: 3.0 },
-    ],
-    maxLev: Math.max(1, Math.min(10, Math.floor(100 / (stopPct * 1.6)))),
-    invalidation: `Cierre 15m sobre ${fmt(stop)} anula el setup.`,
-  };
-}
-
-/* ---------- ESTRATEGIA 1: INDICADORES (EMAs, RSI, MACD, Bollinger) ---------- */
-function buildIndicatorSignal(tf15, tf1h, tf4h, live, ind, riskMode) {
-  const strict = riskMode !== "flexible";
-  const core = [];
-  const contexto = [];
-  const warnings = [];
-  let bull = 0, bear = 0;
-  let allowLong = true, allowShort = true;
-
-  const tfScore = (t) =>
-    t.ema50 && t.ema200
-      ? t.close > t.ema50 && t.ema50 > t.ema200 ? 1
-        : t.close < t.ema50 && t.ema50 < t.ema200 ? -1 : 0
-      : 0;
-  const biasScore = 2 * tfScore(tf4h) + tfScore(tf1h);
-  const bias = biasScore >= 2 ? "ALCISTA" : biasScore <= -2 ? "BAJISTA" : "RANGO";
-
-  if (ind.emas) {
-    if (tf15.ema9 > tf15.ema21 && tf15.close > tf15.ema21) {
-      core.push({ n: "EMAs 9/21", v: "Cruce alcista confirmado al cierre", d: "up" }); bull++;
-    } else if (tf15.ema9 < tf15.ema21 && tf15.close < tf15.ema21) {
-      core.push({ n: "EMAs 9/21", v: "Cruce bajista confirmado al cierre", d: "down" }); bear++;
-    } else {
-      core.push({ n: "EMAs 9/21", v: "Entrelazadas / sin definir", d: "flat" });
-    }
-  }
-
-  if (ind.rsi) {
-    const R = tf15.rsi;
-    if (R >= 70) {
-      core.push({ n: "RSI 14", v: `${R.toFixed(1)} - sobrecompra (bloquea LARGOS)`, d: "down" });
-      bear++; allowLong = false;
-    } else if (R <= 30) {
-      core.push({ n: "RSI 14", v: `${R.toFixed(1)} - sobreventa (bloquea CORTOS)`, d: "up" });
-      bull++; allowShort = false;
-    } else if (R > 55) {
-      core.push({ n: "RSI 14", v: `${R.toFixed(1)} - momentum alcista`, d: "up" }); bull++;
-    } else if (R < 45) {
-      core.push({ n: "RSI 14", v: `${R.toFixed(1)} - momentum bajista`, d: "down" }); bear++;
-    } else {
-      core.push({ n: "RSI 14", v: `${R.toFixed(1)} - zona neutra 45-55, sin voto`, d: "flat" });
-    }
-  }
-
-  if (ind.macd) {
-    if (tf15.macdLine > tf15.macdSignal) {
-      core.push({ n: "MACD", v: "Linea sobre senal", d: "up" }); bull++;
-    } else {
-      core.push({ n: "MACD", v: "Linea bajo senal", d: "down" }); bear++;
-    }
-  }
-
-  if (ind.boll) {
-    if (tf15.close >= tf15.bbUpper) {
-      core.push({ n: "Bollinger", v: "Cierre sobre banda superior - sobreextension (frena LARGOS)", d: "down" });
-      bear++; allowLong = false;
-    } else if (tf15.close <= tf15.bbLower) {
-      core.push({ n: "Bollinger", v: "Cierre bajo banda inferior - sobreextension (frena CORTOS)", d: "up" });
-      bull++; allowShort = false;
-    } else if (tf15.bbWidth < 3) {
-      core.push({ n: "Bollinger", v: `Squeeze (${tf15.bbWidth.toFixed(1)}%) - expansion proxima, sin voto`, d: "flat" });
-    } else if (tf15.close > tf15.bbMid) {
-      core.push({ n: "Bollinger", v: "Sobre la banda media - sesgo alcista", d: "up" }); bull++;
-    } else {
-      core.push({ n: "Bollinger", v: "Bajo la banda media - sesgo bajista", d: "down" }); bear++;
-    }
-  }
-
-  const nEnabled = ["emas", "rsi", "macd", "boll"].filter((k) => ind[k]).length;
-
-  // Contexto informativo (no vota)
-  if (tf15.volRatio > 1.5) {
-    contexto.push({
-      n: "Volumen",
-      v: `${tf15.volRatio.toFixed(2)}x la media en vela ${tf15.candleDir > 0 ? "alcista" : tf15.candleDir < 0 ? "bajista" : "doji"}`,
-      d: tf15.candleDir > 0 ? "up" : tf15.candleDir < 0 ? "down" : "flat",
-    });
-  } else if (tf15.volRatio < 0.6) {
-    contexto.push({ n: "Volumen", v: `${tf15.volRatio.toFixed(2)}x - seco; cualquier ruptura es sospechosa`, d: "flat" });
-  } else {
-    contexto.push({ n: "Volumen", v: `${tf15.volRatio.toFixed(2)}x la media - normal`, d: "flat" });
-  }
-  const distSup = ((live - tf15.support) / live) * 100;
-  const distRes = ((tf15.resistance - live) / live) * 100;
-  contexto.push({
-    n: "Sop/Res",
-    v: `Soporte ${fmt(tf15.support)} (${distSup.toFixed(1)}%) · Resistencia ${fmt(tf15.resistance)} (${distRes.toFixed(1)}%)`,
-    d: "flat",
-  });
-
-  let signal = "SIN OPERAR", dir = null, invalidation = "", blockedDir = null;
-  const needed = Math.max(1, Math.ceil((nEnabled * 2) / 3));
-
-  if (nEnabled === 0) {
-    invalidation = "Activa al menos un indicador para generar senales.";
-  } else if (bull >= needed && bull > bear) {
-    const razones = [];
-    if (!allowLong) razones.push("hay sobrecompra/sobreextension (entrar aqui es perseguir)");
-    if (bias === "BAJISTA") razones.push("el sesgo 4h/1h es BAJISTA (contra la tendencia mayor)");
-    if (razones.length && strict) {
-      blockedDir = "long";
-      invalidation = `Confluencia alcista (${bull} de ${nEnabled} votos) pero ${razones.join(" y ")}.`;
-    } else {
-      razones.forEach((r) => warnings.push(`Advertencia: ${r}.`));
-      signal = "LARGO"; dir = "long";
-    }
-  } else if (bear >= needed && bear > bull) {
-    const razones = [];
-    if (!allowShort) razones.push("hay sobreventa/sobreextension (vender la capitulacion es mal negocio)");
-    if (bias === "ALCISTA") razones.push("el sesgo 4h/1h es ALCISTA (contra la tendencia mayor)");
-    if (razones.length && strict) {
-      blockedDir = "short";
-      invalidation = `Confluencia bajista (${bear} de ${nEnabled} votos) pero ${razones.join(" y ")}.`;
-    } else {
-      razones.forEach((r) => warnings.push(`Advertencia: ${r}.`));
-      signal = "CORTO"; dir = "short";
-    }
-  }
-
-  const A = tf15.atr || live * 0.01;
-  const extATR = tf15.atr ? (live - tf15.ema21) / tf15.atr : 0;
-  if (dir === "long" && extATR > 3) {
-    const msg = `Sobreextendido: ${extATR.toFixed(1)} ATR sobre la EMA21. El movimiento ya corrio; lo sano es esperar retroceso hacia EMA9/21.`;
-    if (strict) { signal = "SIN OPERAR"; dir = null; blockedDir = "long"; invalidation = msg; }
-    else warnings.push(msg);
-  }
-  if (dir === "short" && extATR < -3) {
-    const msg = `Sobreextendido a la baja: ${Math.abs(extATR).toFixed(1)} ATR bajo la EMA21. Lo sano es esperar el rebote tecnico antes de vender.`;
-    if (strict) { signal = "SIN OPERAR"; dir = null; blockedDir = "short"; invalidation = msg; }
-    else warnings.push(msg);
-  }
-
-  let levels = {};
-  if (dir === "long") {
-    levels = buildLevels("long", live, A, Math.min(live - 1.8 * A, tf15.support * 0.998), tf15, tf1h, strict);
-  } else if (dir === "short") {
-    levels = buildLevels("short", live, A, Math.max(live + 1.8 * A, tf15.resistance * 1.002), tf15, tf1h, strict);
-  }
-  if (levels.blocked) {
-    blockedDir = dir; signal = "SIN OPERAR"; dir = null;
-    invalidation = levels.reason;
-    levels = { roomR: levels.roomR, ceiling: levels.ceiling };
-  } else if (levels.warning) {
-    warnings.push(levels.warning);
-  }
-
-  let confidence = "-";
-  if (dir) {
-    const ratio = (dir === "long" ? bull : bear) / nEnabled;
-    confidence = ratio >= 1 ? "ALTA" : ratio >= 0.75 ? "MEDIA" : "BAJA";
-    if (warnings.length >= 2) confidence = "BAJA";
-    else if (warnings.length === 1 && confidence === "ALTA") confidence = "MEDIA";
-  }
-
-  return {
-    modo: "indicadores", bias, signal, dir, tipo: "confluencia", confidence,
-    core, contexto, bull, bear, nEnabled, needed, warnings, blockedDir, riskMode,
-    entry: levels.entry ?? null, zone: levels.zone ?? null, stop: levels.stop ?? null,
-    tps: levels.tps ?? [], roomR: levels.roomR ?? null, ceiling: levels.ceiling ?? null,
-    maxLev: levels.maxLev ?? null,
-    invalidation: dir ? levels.invalidation : invalidation,
-    atrVal: A, extATR,
-  };
-}
-
-/* ---------- ESTRATEGIA 2: ESTRUCTURA (BOS / CHoCH) ---------- */
-function buildStructureSignal(c15, tf15, c1h, tf1h, live, riskMode) {
-  const strict = riskMode !== "flexible";
-  const st = structureEngine(c15);
-  const st1h = structureEngine(c1h);
-  const bias = st1h.trend === 1 ? "ALCISTA" : st1h.trend === -1 ? "BAJISTA" : "RANGO";
-  const A = tf15.atr || live * 0.01;
-  const extATR = tf15.atr ? (live - tf15.ema21) / tf15.atr : 0;
-  const warnings = [];
-
-  const lastEv = st.events.length ? st.events[st.events.length - 1] : null;
-  const age = lastEv ? st.n - 1 - lastEv.t : null;
-  const RECENT = 12; // ~3 horas en 15m
-
-  let signal = "SIN OPERAR", dir = null, confidence = "-", invalidation = "", blockedDir = null;
-
-  if (!lastEv) {
-    invalidation = "Sin eventos de estructura (BOS/CHoCH) en las velas analizadas.";
-  } else if (age > RECENT) {
-    invalidation = `Ultimo evento: ${lastEv.type} en ${fmt(lastEv.level)} hace ${age} velas de 15m - ya no es accionable. Esperar un nuevo BOS o CHoCH.`;
-  } else if (lastEv.dir === "up") {
-    const isBos = lastEv.type.startsWith("BOS");
-    if (isBos && st1h.trend === -1 && strict) {
-      blockedDir = "long";
-      invalidation = `BOS alcista en 15m (hace ${age} velas) pero la estructura 1h sigue bajista: ruptura contra la tendencia mayor. Mejor esperar CHoCH tambien en 1h.`;
-    } else {
-      if (isBos && st1h.trend === -1) warnings.push("Advertencia: BOS alcista contra la estructura bajista de 1h.");
-      signal = "LARGO"; dir = "long";
-      confidence = isBos ? (st1h.trend === 1 ? "ALTA" : "MEDIA") : (st1h.trend === -1 ? "BAJA" : "MEDIA");
-    }
-  } else {
-    const isBos = lastEv.type.startsWith("BOS");
-    if (isBos && st1h.trend === 1 && strict) {
-      blockedDir = "short";
-      invalidation = `BOS bajista en 15m (hace ${age} velas) pero la estructura 1h sigue alcista: ruptura contra la tendencia mayor. Mejor esperar CHoCH tambien en 1h.`;
-    } else {
-      if (isBos && st1h.trend === 1) warnings.push("Advertencia: BOS bajista contra la estructura alcista de 1h.");
-      signal = "CORTO"; dir = "short";
-      confidence = isBos ? (st1h.trend === -1 ? "ALTA" : "MEDIA") : (st1h.trend === 1 ? "BAJA" : "MEDIA");
-    }
-  }
-
-  if (dir === "long" && extATR > 3) {
-    const msg = `${lastEv.type} valido pero el precio esta ${extATR.toFixed(1)} ATR sobre la EMA21: perseguir la ruptura aqui es entrar tarde. Lo sano es esperar el retest del nivel ${fmt(lastEv.level)}.`;
-    if (strict) { signal = "SIN OPERAR"; dir = null; confidence = "-"; blockedDir = "long"; invalidation = msg; }
-    else warnings.push(msg);
-  }
-  if (dir === "short" && extATR < -3) {
-    const msg = `${lastEv.type} valido pero el precio esta ${Math.abs(extATR).toFixed(1)} ATR bajo la EMA21. Lo sano es esperar el retest del nivel ${fmt(lastEv.level)}.`;
-    if (strict) { signal = "SIN OPERAR"; dir = null; confidence = "-"; blockedDir = "short"; invalidation = msg; }
-    else warnings.push(msg);
-  }
-
-  let levels = {};
-  if (dir === "long") {
-    const swingLow = st.lastL ? st.lastL.price : live - 1.8 * A;
-    levels = buildLevels("long", live, A, Math.min(swingLow * 0.998, live - 0.8 * A), tf15, tf1h, strict);
-  } else if (dir === "short") {
-    const swingHigh = st.lastH ? st.lastH.price : live + 1.8 * A;
-    levels = buildLevels("short", live, A, Math.max(swingHigh * 1.002, live + 0.8 * A), tf15, tf1h, strict);
-  }
-  if (levels.blocked) {
-    blockedDir = dir; signal = "SIN OPERAR"; dir = null; confidence = "-";
-    invalidation = levels.reason;
-    levels = { roomR: levels.roomR, ceiling: levels.ceiling };
-  } else if (levels.warning) {
-    warnings.push(levels.warning);
-  }
-
-  if (dir && warnings.length) {
-    if (warnings.length >= 2) confidence = "BAJA";
-    else if (confidence === "ALTA") confidence = "MEDIA";
-  }
-
-  return {
-    modo: "estructura", bias, signal, dir, tipo: "estructura", confidence,
-    core: [], contexto: [], bull: 0, bear: 0, warnings, blockedDir, riskMode,
-    structure: st, structure1h: st1h,
-    lastEvent: lastEv ? { ...lastEv, age } : null,
-    entry: levels.entry ?? null, zone: levels.zone ?? null, stop: levels.stop ?? null,
-    tps: levels.tps ?? [], roomR: levels.roomR ?? null, ceiling: levels.ceiling ?? null,
-    maxLev: levels.maxLev ?? null,
-    invalidation: dir ? levels.invalidation : invalidation,
-    atrVal: A, extATR,
-  };
-}
-
-/* ---------- UI ---------- */
+/* ---------- UI helpers ---------- */
 const Dot = ({ d }) => (
   <span style={{
     display: "inline-block", width: 7, height: 7, borderRadius: 2, marginRight: 8, flexShrink: 0,
@@ -533,24 +14,18 @@ const Dot = ({ d }) => (
   }} />
 );
 
-const STABLES = new Set([
-  "USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "USDPUSDT", "DAIUSDT",
-  "EURUSDT", "AEURUSDT", "EURIUSDT", "XUSDUSDT",
-]);
-
-// Clasificacion por tipo de activo en Binance spot. Listas editables:
-// agrega aqui los simbolos si Binance lista nuevos activos tokenizados.
-const COMMODITIES = new Set(["PAXGUSDT"]); // Pax Gold (oro tokenizado)
-const STOCK_TOKENS = new Set([]); // Binance retiro los stock tokens del spot; vacio por ahora
-const assetCat = (sym) =>
-  COMMODITIES.has(sym) ? "commodities" : STOCK_TOKENS.has(sym) ? "acciones" : "cripto";
-
-const CAT_LABELS = [
-  ["todos", "TODOS"], ["cripto", "CRIPTO"],
-  ["commodities", "MATERIAS PRIMAS"], ["acciones", "ACCIONES"],
-];
-
 const trendTxt = (t) => (t === 1 ? "ALCISTA" : t === -1 ? "BAJISTA" : "SIN DEFINIR");
+const CONF_RANK = { ALTA: 3, MEDIA: 2, BAJA: 1 };
+
+const FACTOR_LABELS = {
+  sesgo: "sesgo 4h/1h", "estrategia:estructura": "estrategia estructura", "dir:corto": "direccion corto",
+  "conf:alta": "confianza alta", "conf:baja": "confianza baja", rsi: "nivel de RSI",
+  volumen: "volumen relativo", extension: "extension vs EMA21", "evento:bos": "evento BOS",
+  "evento:choch": "evento CHoCH", advertencias: "advertencias activas",
+  "hora:sin": "hora del dia", "hora:cos": "hora del dia",
+};
+const factorLabel = (name) =>
+  FACTOR_LABELS[name] ?? (name.startsWith("subcat:") ? `categoria ${name.slice(7)}` : name);
 
 export default function BinanceCopiloto() {
   const [tab, setTab] = useState("scan");
@@ -568,6 +43,21 @@ export default function BinanceCopiloto() {
   const [ind, setInd] = useState({ emas: true, rsi: true, macd: true, boll: true });
   const [riskMode, setRiskMode] = useState("estricto");
   const [cat, setCat] = useState("todos");
+  const [subcat, setSubcat] = useState("todas");
+
+  // Top 3 con motor real
+  const [top3Sig, setTop3Sig] = useState([]);
+  const [top3Busy, setTop3Busy] = useState(false);
+  const [top3Msg, setTop3Msg] = useState(null);
+  const candleCache = useRef(new Map());
+
+  // Motor de aprendizaje
+  const [trackerTick, setTrackerTick] = useState(0);
+  const [lastRec, setLastRec] = useState(null);
+  const [btBusy, setBtBusy] = useState(false);
+  const [btProg, setBtProg] = useState(null);
+  const [verifyMsg, setVerifyMsg] = useState(null);
+  const importRef = useRef(null);
 
   const scan = useCallback(async () => {
     setScanning(true); setErr(null);
@@ -600,38 +90,77 @@ export default function BinanceCopiloto() {
 
   useEffect(() => { scan(); }, []);
 
-  const visibleTickers = useMemo(
-    () => (cat === "todos" ? tickers : tickers.filter((t) => t.cat === cat)),
-    [tickers, cat]
-  );
+  // Al abrir la app: resolver senales pendientes en segundo plano.
+  useEffect(() => {
+    resolveOpenSignals()
+      .then((r) => { if (r.resolved) setTrackerTick((t) => t + 1); })
+      .catch(() => {});
+  }, []);
 
-  const top3 = useMemo(() => {
-    if (!visibleTickers.length) return [];
-    const mom = [...visibleTickers].filter((t) => Math.abs(t.change) > 3)
-      .map((t) => ({ ...t, tipo: "momentum", dir: t.change > 0 ? "LARGO" : "CORTO", score: Math.abs(t.change) * Math.log10(t.quoteVol) }))
-      .sort((a, b) => b.score - a.score).slice(0, 6);
-    const rev = [...visibleTickers].filter((t) => t.rangePos < 0.08 || t.rangePos > 0.92)
-      .map((t) => ({ ...t, tipo: "reversion", dir: t.rangePos < 0.08 ? "LARGO" : "CORTO", score: Math.log10(t.quoteVol) * 2 }))
-      .sort((a, b) => b.score - a.score).slice(0, 6);
-    const seen = new Set();
-    return [...mom, ...rev]
-      .filter((t) => { if (seen.has(t.symbol)) return false; seen.add(t.symbol); return true; })
-      .sort((a, b) => b.score - a.score).slice(0, 3);
-  }, [visibleTickers]);
+  const visibleTickers = useMemo(() => {
+    let rows = cat === "todos" ? tickers : tickers.filter((t) => t.cat === cat);
+    if (cat === "cripto" && subcat !== "todas") rows = rows.filter((t) => subCat(t.symbol) === subcat);
+    return rows;
+  }, [tickers, cat, subcat]);
 
-  const fetchCandles = async (sym, interval, limit = 300) => {
-    const raw = await fetchJson(`/klines?symbol=${sym}&interval=${interval}&limit=${limit}`);
-    return raw.map((c) => ({
-      time: c[0], open: +c[1], high: +c[2], low: +c[3], close: +c[4], volume: +c[5],
-    }));
-  };
+  const getCandlesCached = useCallback(async (sym) => {
+    const now = Date.now();
+    const hit = candleCache.current.get(sym);
+    if (hit && now - hit.ts < 5 * 60 * 1000) return hit.data;
+    const [c15, c1h, c4h] = await Promise.all([
+      fetchCandles(sym, "15m"), fetchCandles(sym, "1h"), fetchCandles(sym, "4h"),
+    ]);
+    const data = { c15, c1h, c4h };
+    candleCache.current.set(sym, { ts: now, data });
+    return data;
+  }, []);
+
+  // TOP 3 con el motor real: corre la estrategia activa sobre los candidatos del filtro.
+  const computeTop3 = useCallback(async () => {
+    if (!visibleTickers.length) { setTop3Sig([]); setTop3Msg(null); return; }
+    setTop3Busy(true); setTop3Msg(null);
+    try {
+      const candidates = [...visibleTickers].sort((a, b) => b.quoteVol - a.quoteVol).slice(0, 12);
+      const results = [];
+      for (let i = 0; i < candidates.length; i += 4) {
+        const batch = candidates.slice(i, i + 4);
+        const settled = await Promise.allSettled(batch.map(async (t) => {
+          const { c15, c1h, c4h } = await getCandlesCached(t.symbol);
+          const live = c15[c15.length - 1].close;
+          const sig = evaluate(c15, c1h, c4h, live, strategy, ind, riskMode);
+          if (!sig.dir) return null;
+          return { symbol: t.symbol, live, sig, prob: probability(sig, t.symbol) };
+        }));
+        settled.forEach((s) => { if (s.status === "fulfilled" && s.value) results.push(s.value); });
+      }
+      results.sort((a, b) =>
+        ((b.prob?.p ?? 0.5) - (a.prob?.p ?? 0.5)) ||
+        ((CONF_RANK[b.sig.confidence] ?? 0) - (CONF_RANK[a.sig.confidence] ?? 0))
+      );
+      setTop3Sig(results.slice(0, 3));
+      if (!results.length) {
+        setTop3Msg(`Sin senales ${strategy === "estructura" ? "de estructura" : "de indicadores"} activas en esta categoria ahora mismo. ${riskMode === "estricto" ? "Prueba el filtro FLEXIBLE para ver setups con advertencias." : "Esperar tambien es una posicion."}`);
+      }
+    } catch (e) {
+      setTop3Msg(`No se pudo evaluar el Top 3: ${e.message}`);
+    }
+    setTop3Busy(false);
+  }, [visibleTickers, strategy, ind, riskMode, getCandlesCached]);
+
+  // Recalcula el Top 3 al cambiar filtros/estrategia (con debounce).
+  useEffect(() => {
+    if (tab !== "scan" || !visibleTickers.length) return;
+    const t = setTimeout(computeTop3, 400);
+    return () => clearTimeout(t);
+  }, [computeTop3, tab]);
 
   const analyze = async (sym) => {
     setAnalyzing(true); setErr(null);
     try {
       const s = sym.toUpperCase().replace(/[/_]/g, "");
       const [c15, c1h, c4h, cBtc] = await Promise.all([
-        fetchCandles(s, "15m"), fetchCandles(s, "1h"), fetchCandles(s, "4h"), fetchCandles("BTCUSDT", "4h", 250),
+        fetchCandles(s, "15m"), fetchCandles(s, "1h"), fetchCandles(s, "4h"),
+        fetchCandles("BTCUSDT", "4h", 250),
       ]);
       setMarket({ symbol: s, time: new Date(), live: c15[c15.length - 1].close, c15, c1h, c4h, cBtc });
       setTab("analyze");
@@ -641,19 +170,27 @@ export default function BinanceCopiloto() {
     setAnalyzing(false);
   };
 
-  // La senal se recalcula al instante al cambiar estrategia o indicadores, sin re-descargar datos.
+  // La senal se recalcula al instante al cambiar estrategia/indicadores/filtro.
   const analysis = useMemo(() => {
     if (!market) return null;
-    const closed = (arr) => arr.slice(0, -1);
-    const c15c = closed(market.c15), c1hc = closed(market.c1h);
-    const t15 = analyzeTF(c15c);
-    const t1h = analyzeTF(c1hc);
-    const t4h = analyzeTF(closed(market.c4h));
-    const sig = strategy === "estructura"
-      ? buildStructureSignal(c15c, t15, c1hc, t1h, market.live, riskMode)
-      : buildIndicatorSignal(t15, t1h, t4h, market.live, ind, riskMode);
-    return { symbol: market.symbol, time: market.time, live: market.live, tf15: t15, tf1h: t1h, tf4h: t4h, ...sig };
+    const sig = evaluate(market.c15, market.c1h, market.c4h, market.live, strategy, ind, riskMode);
+    return { symbol: market.symbol, time: market.time, live: market.live, ...sig };
   }, [market, strategy, ind, riskMode]);
+
+  const prob = useMemo(
+    () => (analysis?.dir && market ? probability(analysis, market.symbol, market.time.getTime()) : null),
+    [analysis, market, trackerTick]
+  );
+
+  // Registro automatico de cada senal accionable (con dedupe en el tracker).
+  useEffect(() => {
+    if (!analysis?.dir || !market) { setLastRec(null); return; }
+    recordSignal(analysis, market.symbol, market.live, market.time.getTime());
+    const mine = [...getSignals()].reverse().find(
+      (s) => s.symbol === market.symbol && s.dir === analysis.dir && s.modo === analysis.modo
+    );
+    setLastRec(mine ? { id: mine.id, taken: mine.taken } : null);
+  }, [analysis, market]);
 
   const btcCtx = useMemo(() => {
     if (!market) return null;
@@ -680,6 +217,70 @@ export default function BinanceCopiloto() {
     };
   }, [analysis, capital, riskPct]);
 
+  /* ---------- Acciones del Record ---------- */
+  const doVerify = async () => {
+    setVerifyMsg("Verificando senales abiertas...");
+    try {
+      const r = await resolveOpenSignals();
+      setVerifyMsg(r.resolved ? `${r.resolved} senal(es) resueltas; ${r.open} siguen abiertas.` : `Sin cambios: ${r.open} senal(es) siguen abiertas.`);
+      setTrackerTick((t) => t + 1);
+    } catch (e) {
+      setVerifyMsg(`Error al verificar: ${e.message}`);
+    }
+  };
+
+  const doBacktest = async () => {
+    if (btBusy) return;
+    setBtBusy(true);
+    setBtProg({ done: 0, total: 1, sym: "", fase: "preparando" });
+    try {
+      let syms = [...tickers].sort((a, b) => b.quoteVol - a.quoteVol).slice(0, 20).map((t) => t.symbol);
+      if (!syms.length) syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"];
+      await runBacktest({ symbols: syms, strategy, ind, riskMode, days: 90, onProgress: setBtProg });
+      setTrackerTick((t) => t + 1);
+    } catch (e) {
+      setErr(`El backtest fallo: ${e.message}`);
+    }
+    setBtBusy(false);
+  };
+
+  const doExport = () => {
+    const blob = new Blob([exportJSON()], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `copiloto-record-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  const doImport = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { importJSON(reader.result); setTrackerTick((t) => t + 1); setVerifyMsg("Record importado."); }
+      catch { setVerifyMsg("Archivo invalido."); }
+    };
+    reader.readAsText(f);
+    e.target.value = "";
+  };
+
+  const doClear = () => {
+    if (window.confirm("¿Borrar TODO el record (senales, estadisticas y modelo)? Esta accion no se puede deshacer.")) {
+      clearAll();
+      setTrackerTick((t) => t + 1);
+      setVerifyMsg("Record borrado.");
+    }
+  };
+
+  const recStats = useMemo(() => trackerStats(), [trackerTick, tab]);
+  const recordRows = useMemo(() => {
+    const live = getSignals().map((s) => ({ ...s }));
+    const bt = getBtSample();
+    return [...live, ...bt].sort((a, b) => b.ts - a.ts).slice(0, 120);
+  }, [trackerTick, tab]);
+
+  /* ---------- Estilos ---------- */
   const C = {
     bg: "#0a0e17", panel: "#111827", panel2: "#0d1420", border: "#1f2937",
     text: "#e5e7eb", dim: "#6b7280", green: "#00d4aa", red: "#ff4d6d", amber: "#fbbf24", accent: "#3b82f6",
@@ -689,12 +290,32 @@ export default function BinanceCopiloto() {
     background: C.panel2, border: `1px solid ${C.border}`, color: C.text,
     padding: "7px 10px", borderRadius: 4, fontFamily: "inherit", fontSize: 12, boxSizing: "border-box",
   };
+  const chipS = (active, color) => ({
+    background: active ? (color === "amber" ? "#2d2000" : "#0d2620") : "transparent",
+    color: active ? (color === "amber" ? C.amber : C.green) : C.dim,
+    border: `1px solid ${active ? (color === "amber" ? C.amber : C.green) : C.border}`,
+    padding: "5px 12px", borderRadius: 4, cursor: "pointer",
+    fontSize: 11, fontWeight: 700, fontFamily: "inherit",
+  });
+  const btnS = (bg, fg) => ({
+    background: bg, color: fg, border: "none", padding: "8px 16px", borderRadius: 4,
+    cursor: "pointer", fontWeight: 700, fontSize: 12, fontFamily: "inherit",
+  });
   const labelColor = (l) =>
     l === "HH" || l === "HL" ? C.green : l === "LH" || l === "LL" ? C.red : C.dim;
+  const outcomeColor = (o, r) =>
+    o === "open" ? C.dim : (r ?? 0) > 0 ? C.green : o === "expired" ? C.amber : C.red;
 
   const INDICATOR_TOGGLES = [
     ["emas", "EMAs"], ["rsi", "RSI"], ["macd", "MACD"], ["boll", "Bollinger"],
   ];
+
+  const probLine = prob && (
+    <span>
+      {(prob.p * 100).toFixed(0)}%
+      {prob.insuficiente ? " · muestra insuficiente" : ` · n=${prob.n}`}
+    </span>
+  );
 
   return (
     <div style={{
@@ -707,14 +328,14 @@ export default function BinanceCopiloto() {
       }}>
         <div>
           <div style={{ fontSize: 16, fontWeight: 700 }}>
-            COPILOTO <span style={{ color: C.amber }}>BINANCE</span> <span style={{ color: C.dim, fontSize: 11 }}>v3</span>
+            COPILOTO <span style={{ color: C.amber }}>BINANCE</span> <span style={{ color: C.dim, fontSize: 11 }}>v4</span>
           </div>
           <div style={{ color: C.dim, fontSize: 11, marginTop: 2 }}>
-            velas cerradas · sin repintado · spot publico
+            velas cerradas · sin repintado · aprende de su propio record
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          {[["scan", "Escaner"], ["analyze", "Analisis"]].map(([k, l]) => (
+          {[["scan", "Escaner"], ["analyze", "Analisis"], ["record", "Record"]].map(([k, l]) => (
             <button key={k} onClick={() => setTab(k)} style={{
               background: tab === k ? C.accent : "transparent", color: tab === k ? "#fff" : C.dim,
               border: `1px solid ${tab === k ? C.accent : C.border}`, padding: "6px 14px",
@@ -731,6 +352,7 @@ export default function BinanceCopiloto() {
         }}>{err}</div>
       )}
 
+      {/* ============ ESCANER ============ */}
       {tab === "scan" && (
         <>
           <div style={{ display: "flex", gap: 12, alignItems: "flex-end", marginBottom: 16, flexWrap: "wrap" }}>
@@ -739,9 +361,8 @@ export default function BinanceCopiloto() {
               <input type="number" value={minVol} onChange={(e) => setMinVol(+e.target.value)} style={{ ...inputS, width: 150 }} />
             </div>
             <button onClick={scan} disabled={scanning} style={{
-              background: scanning ? C.border : C.green, color: scanning ? C.dim : "#00201a",
-              border: "none", padding: "8px 20px", borderRadius: 4,
-              cursor: scanning ? "wait" : "pointer", fontWeight: 700, fontSize: 12, fontFamily: "inherit",
+              ...btnS(scanning ? C.border : C.green, scanning ? C.dim : "#00201a"),
+              cursor: scanning ? "wait" : "pointer",
             }}>
               {scanning ? "ESCANEANDO..." : "ESCANEAR MERCADO"}
             </button>
@@ -753,18 +374,43 @@ export default function BinanceCopiloto() {
           </div>
 
           <div style={{
-            display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center",
+            display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap", alignItems: "center",
             background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "10px 12px",
           }}>
             <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>TIPO DE ACTIVO:</span>
             {CAT_LABELS.map(([k, l]) => (
-              <button key={k} onClick={() => setCat(k)} style={{
-                background: cat === k ? C.amber : "transparent",
-                color: cat === k ? "#2d2000" : C.dim,
-                border: `1px solid ${cat === k ? C.amber : C.border}`,
-                padding: "5px 12px", borderRadius: 4, cursor: "pointer",
-                fontSize: 11, fontWeight: 700, fontFamily: "inherit",
-              }}>{l}</button>
+              <button key={k} onClick={() => { setCat(k); if (k !== "cripto") setSubcat("todas"); }} style={chipS(cat === k, "amber")}>{l}</button>
+            ))}
+          </div>
+
+          {cat === "cripto" && (
+            <div style={{
+              display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center",
+              background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "10px 12px",
+            }}>
+              <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>SUBCATEGORIA:</span>
+              {SUBCAT_LABELS.map(([k, l]) => (
+                <button key={k} onClick={() => setSubcat(k)} style={chipS(subcat === k, "green")}>{l}</button>
+              ))}
+            </div>
+          )}
+
+          <div style={{
+            display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center",
+            background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "10px 12px",
+          }}>
+            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>ESTRATEGIA:</span>
+            {[["indicadores", "INDICADORES"], ["estructura", "ESTRUCTURA"]].map(([k, l]) => (
+              <button key={k} onClick={() => setStrategy(k)} style={chipS(strategy === k, "amber")}>{l}</button>
+            ))}
+            {strategy === "indicadores" && INDICATOR_TOGGLES.map(([k, l]) => (
+              <button key={k} onClick={() => setInd((p) => ({ ...p, [k]: !p[k] }))} style={chipS(ind[k], "green")}>
+                {ind[k] ? "✓ " : ""}{l}
+              </button>
+            ))}
+            <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginLeft: 8 }}>FILTRO:</span>
+            {[["estricto", "ESTRICTO"], ["flexible", "FLEXIBLE"]].map(([k, l]) => (
+              <button key={k} onClick={() => setRiskMode(k)} style={chipS(riskMode === k, k === "estricto" ? "green" : "amber")}>{l}</button>
             ))}
           </div>
 
@@ -777,45 +423,74 @@ export default function BinanceCopiloto() {
                 ? "Binance retiro los stock tokens (acciones tokenizadas) del mercado spot, asi que hoy no hay pares de acciones disponibles. Si los vuelve a listar, se agregan a la lista STOCK_TOKENS del codigo."
                 : cat === "commodities"
                   ? "Sin pares de materias primas que superen el volumen minimo. El principal es PAXG (oro tokenizado); prueba bajando el filtro de volumen."
-                  : "Sin pares en esta categoria con el filtro de volumen actual."}
+                  : "Sin pares en esta categoria/subcategoria con el filtro de volumen actual."}
             </div>
-          )}
-
-          {top3.length > 0 && (
-            <>
-              <div style={{ color: C.amber, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
-                TOP 3 OPORTUNIDADES (preliminar - confirmar en Analisis)
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 12, marginBottom: 24 }}>
-                {top3.map((t) => (
-                  <div key={t.symbol} style={{
-                    background: C.panel, border: `1px solid ${C.border}`,
-                    borderLeft: `3px solid ${t.dir === "LARGO" ? C.green : C.red}`, borderRadius: 4, padding: 14,
-                  }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-                      <span style={{ fontWeight: 700, fontSize: 14 }}>{t.symbol}</span>
-                      <span style={{ fontSize: 10, color: C.dim, textTransform: "uppercase" }}>{t.tipo}</span>
-                    </div>
-                    <div style={{ fontSize: 18, marginBottom: 6 }}>{fmt(t.price)}</div>
-                    <div style={{ color: t.change > 0 ? C.green : C.red, marginBottom: 8 }}>
-                      {t.change > 0 ? "+" : ""}{t.change.toFixed(2)}% 24h
-                    </div>
-                    <div style={{ color: C.dim, fontSize: 11 }}>Vol: {(t.quoteVol / 1e6).toFixed(1)}M USDT</div>
-                    <div style={{ color: C.dim, fontSize: 11, marginBottom: 12 }}>Rango 24h: {(t.rangePos * 100).toFixed(0)}%</div>
-                    <button onClick={() => { setSymbol(t.symbol); analyze(t.symbol); }} disabled={analyzing} style={{
-                      background: "transparent", border: `1px solid ${C.accent}`, color: C.accent,
-                      padding: "6px 12px", borderRadius: 3, cursor: "pointer", fontSize: 11, width: "100%", fontFamily: "inherit",
-                    }}>
-                      ANALIZAR
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </>
           )}
 
           {visibleTickers.length > 0 && (
             <>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+                <div style={{ color: C.amber, fontSize: 11, letterSpacing: "0.1em" }}>
+                  TOP 3 SENALES - motor real ({strategy}) segun tus filtros
+                </div>
+                <button onClick={computeTop3} disabled={top3Busy} style={{
+                  background: "transparent", border: `1px solid ${C.accent}`, color: C.accent,
+                  padding: "4px 10px", borderRadius: 3, cursor: "pointer", fontSize: 10, fontFamily: "inherit",
+                }}>
+                  {top3Busy ? "EVALUANDO..." : "RECALCULAR"}
+                </button>
+              </div>
+
+              {top3Busy && !top3Sig.length && (
+                <div style={{ color: C.dim, padding: 20, textAlign: "center", border: `1px dashed ${C.border}`, borderRadius: 4, marginBottom: 24, fontSize: 12 }}>
+                  Corriendo la estrategia sobre los candidatos de esta categoria...
+                </div>
+              )}
+
+              {!top3Busy && top3Msg && (
+                <div style={{ color: C.dim, padding: 20, textAlign: "center", border: `1px dashed ${C.border}`, borderRadius: 4, marginBottom: 24, fontSize: 12, lineHeight: 1.6 }}>
+                  {top3Msg}
+                </div>
+              )}
+
+              {top3Sig.length > 0 && (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(250px,1fr))", gap: 12, marginBottom: 24 }}>
+                  {top3Sig.map((t) => (
+                    <div key={t.symbol} style={{
+                      background: C.panel, border: `1px solid ${C.border}`,
+                      borderLeft: `3px solid ${t.sig.dir === "long" ? C.green : C.red}`, borderRadius: 4, padding: 14,
+                    }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                        <span style={{ fontWeight: 700, fontSize: 14 }}>{t.symbol}</span>
+                        <span style={{ fontWeight: 700, color: t.sig.dir === "long" ? C.green : C.red }}>
+                          {t.sig.signal}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 18, marginBottom: 6 }}>{fmt(t.live)}</div>
+                      <div style={{ fontSize: 12, marginBottom: 4 }}>
+                        <span style={{ color: C.amber }}>
+                          Prob: {t.prob ? `${(t.prob.p * 100).toFixed(0)}%` : "-"}
+                        </span>
+                        <span style={{ color: C.dim }}>
+                          {t.prob ? (t.prob.insuficiente ? " (muestra insuficiente)" : ` (n=${t.prob.n})`) : ""}
+                        </span>
+                      </div>
+                      <div style={{ color: C.dim, fontSize: 11 }}>Confianza: {t.sig.confidence} · {t.sig.tipo}</div>
+                      <div style={{ color: C.dim, fontSize: 11 }}>Entrada ~{fmt(t.sig.entry)} · Stop {fmt(t.sig.stop)}</div>
+                      {t.sig.warnings?.length > 0 && (
+                        <div style={{ color: C.amber, fontSize: 10, marginTop: 4 }}>⚠ {t.sig.warnings.length} advertencia(s)</div>
+                      )}
+                      <button onClick={() => { setSymbol(t.symbol); analyze(t.symbol); }} disabled={analyzing} style={{
+                        background: "transparent", border: `1px solid ${C.accent}`, color: C.accent, marginTop: 10,
+                        padding: "6px 12px", borderRadius: 3, cursor: "pointer", fontSize: 11, width: "100%", fontFamily: "inherit",
+                      }}>
+                        VER ANALISIS COMPLETO
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
                 MERCADO - TOP 40 POR VOLUMEN
               </div>
@@ -865,6 +540,7 @@ export default function BinanceCopiloto() {
         </>
       )}
 
+      {/* ============ ANALISIS ============ */}
       {tab === "analyze" && (
         <>
           <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
@@ -876,9 +552,7 @@ export default function BinanceCopiloto() {
               style={{ ...inputS, width: 160, fontSize: 13, padding: "8px 12px" }}
             />
             <button onClick={() => analyze(symbol)} disabled={analyzing} style={{
-              background: analyzing ? C.border : C.accent, color: "#fff", border: "none",
-              padding: "8px 20px", borderRadius: 4, cursor: analyzing ? "wait" : "pointer",
-              fontWeight: 700, fontSize: 12, fontFamily: "inherit",
+              ...btnS(analyzing ? C.border : C.accent, "#fff"), cursor: analyzing ? "wait" : "pointer",
             }}>
               {analyzing ? "CALCULANDO..." : "ANALIZAR"}
             </button>
@@ -896,37 +570,21 @@ export default function BinanceCopiloto() {
           }}>
             <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em" }}>ESTRATEGIA:</span>
             {[["indicadores", "INDICADORES"], ["estructura", "ESTRUCTURA (BOS/CHoCH)"]].map(([k, l]) => (
-              <button key={k} onClick={() => setStrategy(k)} style={{
-                background: strategy === k ? C.amber : "transparent",
-                color: strategy === k ? "#2d2000" : C.dim,
-                border: `1px solid ${strategy === k ? C.amber : C.border}`,
-                padding: "5px 12px", borderRadius: 4, cursor: "pointer",
-                fontSize: 11, fontWeight: 700, fontFamily: "inherit",
-              }}>{l}</button>
+              <button key={k} onClick={() => setStrategy(k)} style={chipS(strategy === k, "amber")}>{l}</button>
             ))}
             {strategy === "indicadores" && (
               <>
                 <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginLeft: 8 }}>USAR:</span>
                 {INDICATOR_TOGGLES.map(([k, l]) => (
-                  <button key={k} onClick={() => setInd((p) => ({ ...p, [k]: !p[k] }))} style={{
-                    background: ind[k] ? "#0d2620" : "transparent",
-                    color: ind[k] ? C.green : C.dim,
-                    border: `1px solid ${ind[k] ? C.green : C.border}`,
-                    padding: "5px 10px", borderRadius: 4, cursor: "pointer",
-                    fontSize: 11, fontFamily: "inherit",
-                  }}>{ind[k] ? "✓ " : ""}{l}</button>
+                  <button key={k} onClick={() => setInd((p) => ({ ...p, [k]: !p[k] }))} style={chipS(ind[k], "green")}>
+                    {ind[k] ? "✓ " : ""}{l}
+                  </button>
                 ))}
               </>
             )}
             <span style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginLeft: 8 }}>FILTRO DE RIESGO:</span>
             {[["estricto", "ESTRICTO"], ["flexible", "FLEXIBLE"]].map(([k, l]) => (
-              <button key={k} onClick={() => setRiskMode(k)} style={{
-                background: riskMode === k ? (k === "estricto" ? "#0d2620" : "#2d2000") : "transparent",
-                color: riskMode === k ? (k === "estricto" ? C.green : C.amber) : C.dim,
-                border: `1px solid ${riskMode === k ? (k === "estricto" ? C.green : C.amber) : C.border}`,
-                padding: "5px 12px", borderRadius: 4, cursor: "pointer",
-                fontSize: 11, fontWeight: 700, fontFamily: "inherit",
-              }}>{l}</button>
+              <button key={k} onClick={() => setRiskMode(k)} style={chipS(riskMode === k, k === "estricto" ? "green" : "amber")}>{l}</button>
             ))}
           </div>
 
@@ -950,7 +608,7 @@ export default function BinanceCopiloto() {
                       en vivo · ultimo cierre 15m: {fmt(analysis.tf15.close)}
                     </div>
                     <div style={{ color: C.dim, fontSize: 11 }}>
-                      Binance spot · {analysis.time.toLocaleTimeString("es-CO")} (Bogota)
+                      Binance spot · {analysis.time.toLocaleTimeString("es-CO")} (Bogota) · {subCat(analysis.symbol)}
                     </div>
                   </div>
                   <div style={{ textAlign: "right" }}>
@@ -982,6 +640,52 @@ export default function BinanceCopiloto() {
                   </div>
                 </div>
               </div>
+
+              {analysis.dir && prob && (
+                <div style={{
+                  background: C.panel, border: `1px solid ${C.border}`, borderLeft: `4px solid ${C.amber}`,
+                  borderRadius: 4, padding: 14, marginBottom: 14,
+                }}>
+                  <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em", marginBottom: 8 }}>
+                    PROBABILIDAD HISTORICA (motor de aprendizaje)
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 12, alignItems: "center" }}>
+                    <div>
+                      <span style={{ fontSize: 24, fontWeight: 700, color: prob.p >= 0.55 ? C.green : prob.p <= 0.45 ? C.red : C.text }}>
+                        {probLine}
+                      </span>
+                      <div style={{ color: C.dim, fontSize: 11, marginTop: 4 }}>
+                        modelo: {(prob.pModel * 100).toFixed(0)}% · segmentos: {(prob.pBuckets * 100).toFixed(0)}%
+                        {prob.divergente ? " · DIVERGEN: tomar el rango, no el numero" : ""}
+                      </div>
+                      {prob.factores?.length > 0 && (
+                        <div style={{ color: C.dim, fontSize: 11, marginTop: 4 }}>
+                          {prob.factores.map((f, i) => (
+                            <span key={i} style={{ marginRight: 10, color: f.sube ? C.green : C.red }}>
+                              {f.sube ? "▲" : "▼"} {factorLabel(f.name)}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    {lastRec && (
+                      <button onClick={() => { markTaken(lastRec.id, !lastRec.taken); setLastRec({ ...lastRec, taken: !lastRec.taken }); }} style={{
+                        background: lastRec.taken ? "#0d2620" : "transparent",
+                        color: lastRec.taken ? C.green : C.dim,
+                        border: `1px solid ${lastRec.taken ? C.green : C.border}`,
+                        padding: "8px 14px", borderRadius: 4, cursor: "pointer", fontSize: 11, fontFamily: "inherit",
+                      }}>
+                        {lastRec.taken ? "✓ LA TOME" : "MARCAR: LA TOME"}
+                      </button>
+                    )}
+                  </div>
+                  {prob.insuficiente && (
+                    <div style={{ color: C.amber, fontSize: 11, marginTop: 8, lineHeight: 1.5 }}>
+                      Aun hay pocas muestras para confiar en este numero. Corre el backtest de 90 dias en la pestana Record para sembrar el historial.
+                    </div>
+                  )}
+                </div>
+              )}
 
               {btcCtx && (
                 <div style={{
@@ -1260,12 +964,193 @@ export default function BinanceCopiloto() {
               }}>
                 Senales calculadas sobre velas CERRADAS (sin repintado); el precio en vivo puede diferir del ultimo cierre.
                 Los pivotes de estructura se confirman 3 velas despues de formarse.
+                La probabilidad historica describe el pasado del propio motor, no garantiza el futuro.
                 Verifica precio, ATR, soportes y liquidacion en tu plataforma antes de ejecutar.
                 Herramienta de gestion de riesgo, no recomendacion de inversion.
                 La mayoria de traders minoristas de cripto pierde dinero.
               </div>
             </>
           )}
+        </>
+      )}
+
+      {/* ============ RECORD ============ */}
+      {tab === "record" && (
+        <>
+          <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+            <button onClick={doVerify} style={btnS(C.accent, "#fff")}>VERIFICAR RESULTADOS</button>
+            <button onClick={doBacktest} disabled={btBusy} style={{
+              ...btnS(btBusy ? C.border : C.amber, btBusy ? C.dim : "#2d2000"),
+              cursor: btBusy ? "wait" : "pointer",
+            }}>
+              {btBusy ? "CORRIENDO BACKTEST..." : "BACKTEST 90 DIAS"}
+            </button>
+            <button onClick={doExport} style={{ ...btnS("transparent", C.dim), border: `1px solid ${C.border}` }}>EXPORTAR</button>
+            <button onClick={() => importRef.current?.click()} style={{ ...btnS("transparent", C.dim), border: `1px solid ${C.border}` }}>IMPORTAR</button>
+            <input ref={importRef} type="file" accept="application/json" onChange={doImport} style={{ display: "none" }} />
+            <button onClick={doClear} style={{ ...btnS("transparent", C.red), border: `1px solid ${C.red}` }}>BORRAR TODO</button>
+          </div>
+
+          {btBusy && btProg && (
+            <div style={{
+              background: C.panel, border: `1px solid ${C.amber}`, borderRadius: 4,
+              padding: 14, marginBottom: 16, fontSize: 12,
+            }}>
+              <div style={{ color: C.amber, marginBottom: 8 }}>
+                Backtest {btProg.fase}{btProg.sym ? `: ${btProg.sym}` : ""} ({btProg.done}/{btProg.total} pares)
+              </div>
+              <div style={{ height: 6, background: C.border, borderRadius: 3 }}>
+                <div style={{
+                  height: 6, borderRadius: 3, background: C.amber,
+                  width: `${btProg.total ? (btProg.done / btProg.total) * 100 : 0}%`, transition: "width 0.3s",
+                }} />
+              </div>
+              <div style={{ color: C.dim, fontSize: 11, marginTop: 8 }}>
+                Descarga 90 dias de velas por par y corre la estrategia "{strategy}" con tus filtros actuales.
+                Suele tardar 1-2 minutos. No cierres la pestana.
+              </div>
+            </div>
+          )}
+
+          {verifyMsg && !btBusy && (
+            <div style={{ color: C.dim, fontSize: 12, marginBottom: 16 }}>{verifyMsg}</div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 12, marginBottom: 16 }}>
+            <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
+              <div style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginBottom: 8 }}>SENALES EN VIVO</div>
+              <div style={{ fontSize: 20, fontWeight: 700 }}>
+                {recStats.live.n} <span style={{ fontSize: 12, color: C.dim }}>resueltas · {recStats.openCount} abiertas</span>
+              </div>
+              <div style={{ fontSize: 12, marginTop: 6 }}>
+                Win rate: <span style={{ color: recStats.live.winRate >= 0.5 ? C.green : C.red }}>
+                  {recStats.live.n ? `${(recStats.live.winRate * 100).toFixed(0)}%` : "-"}
+                </span>
+                {" · "}R medio: <span style={{ color: recStats.live.avgR >= 0 ? C.green : C.red }}>
+                  {recStats.live.n ? recStats.live.avgR.toFixed(2) : "-"}
+                </span>
+              </div>
+            </div>
+            <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
+              <div style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginBottom: 8 }}>BACKTEST (SIEMBRA)</div>
+              {recStats.btMeta ? (
+                <>
+                  <div style={{ fontSize: 20, fontWeight: 700 }}>
+                    {recStats.btMeta.signals} <span style={{ fontSize: 12, color: C.dim }}>senales · {recStats.btMeta.days}d · {recStats.btMeta.strategy}</span>
+                  </div>
+                  <div style={{ fontSize: 12, marginTop: 6 }}>
+                    Win rate: <span style={{ color: recStats.btMeta.winRate >= 0.5 ? C.green : C.red }}>
+                      {(recStats.btMeta.winRate * 100).toFixed(0)}%
+                    </span>
+                    {" · "}R medio: <span style={{ color: recStats.btMeta.avgR >= 0 ? C.green : C.red }}>
+                      {recStats.btMeta.avgR.toFixed(2)}
+                    </span>
+                  </div>
+                  <div style={{ color: C.dim, fontSize: 10, marginTop: 4 }}>
+                    {new Date(recStats.btMeta.ranAt).toLocaleDateString("es-CO")}
+                  </div>
+                </>
+              ) : (
+                <div style={{ color: C.dim, fontSize: 12 }}>Sin backtest aun. Corre uno para sembrar probabilidades.</div>
+              )}
+            </div>
+            <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, padding: 14 }}>
+              <div style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginBottom: 8 }}>MODELO (aprendizaje continuo)</div>
+              <div style={{ fontSize: 20, fontWeight: 700 }}>
+                {recStats.modelSeen} <span style={{ fontSize: 12, color: C.dim }}>muestras vistas</span>
+              </div>
+              <div style={{ color: C.dim, fontSize: 11, marginTop: 6, lineHeight: 1.5 }}>
+                Regresion logistica online: se actualiza con cada senal resuelta.
+              </div>
+            </div>
+          </div>
+
+          {recStats.rows.length > 0 && (
+            <>
+              <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
+                WIN RATE POR SEGMENTO (suavizado bayesiano)
+              </div>
+              <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, overflow: "auto", marginBottom: 16, maxHeight: 260 }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ background: C.panel2 }}>
+                      {["SEGMENTO", "MUESTRAS", "WIN RATE"].map((h) => (
+                        <th key={h} style={{ padding: "8px 12px", textAlign: "left", color: C.dim, fontSize: 10, fontWeight: 500, position: "sticky", top: 0, background: C.panel2 }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recStats.rows.map((r) => (
+                      <tr key={r.key} style={{ borderTop: `1px solid ${C.border}` }}>
+                        <td style={{ padding: "7px 12px" }}>{r.key}</td>
+                        <td style={{ padding: "7px 12px", color: C.dim }}>{r.n}</td>
+                        <td style={{ padding: "7px 12px", color: r.winRate >= 0.5 ? C.green : C.red }}>
+                          {(r.winRate * 100).toFixed(0)}%{r.n < 20 ? <span style={{ color: C.dim }}> (pocas muestras)</span> : ""}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+
+          <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
+            SENALES RECIENTES (en vivo + muestra del backtest)
+          </div>
+          {recordRows.length === 0 ? (
+            <div style={{ color: C.dim, padding: 30, textAlign: "center", border: `1px dashed ${C.border}`, borderRadius: 4, fontSize: 12, lineHeight: 1.6 }}>
+              Aun no hay senales registradas. Cada senal LARGO/CORTO que la app genere en Analisis
+              se guarda sola, y el backtest siembra el historico de 90 dias.
+            </div>
+          ) : (
+            <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, overflow: "auto", maxHeight: 420 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr style={{ background: C.panel2 }}>
+                    {["FECHA", "PAR", "DIR", "ESTRATEGIA", "CONF", "RESULTADO", "R", "ORIGEN"].map((h) => (
+                      <th key={h} style={{ padding: "8px 12px", textAlign: "left", color: C.dim, fontSize: 10, fontWeight: 500, position: "sticky", top: 0, background: C.panel2 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {recordRows.map((s, i) => (
+                    <tr key={s.id ?? `bt-${i}`} style={{ borderTop: `1px solid ${C.border}` }}>
+                      <td style={{ padding: "7px 12px", color: C.dim, whiteSpace: "nowrap" }}>
+                        {new Date(s.ts).toLocaleString("es-CO", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                      </td>
+                      <td style={{ padding: "7px 12px", fontWeight: 600 }}>{s.symbol}</td>
+                      <td style={{ padding: "7px 12px", color: s.dir === "long" ? C.green : C.red }}>
+                        {s.dir === "long" ? "LARGO" : "CORTO"}
+                      </td>
+                      <td style={{ padding: "7px 12px", color: C.dim }}>{s.modo}</td>
+                      <td style={{ padding: "7px 12px", color: C.dim }}>{s.confidence}</td>
+                      <td style={{ padding: "7px 12px", color: outcomeColor(s.outcome, s.r) }}>
+                        {s.outcome === "open" ? "abierta" : s.outcome === "expired" ? "expirada" : s.outcome === "win" ? `gano (${s.detail})` : `perdio (${s.detail})`}
+                      </td>
+                      <td style={{ padding: "7px 12px", color: (s.r ?? 0) > 0 ? C.green : (s.r ?? 0) < 0 ? C.red : C.dim }}>
+                        {s.r != null ? `${s.r >= 0 ? "+" : ""}${s.r.toFixed(2)}R` : "-"}
+                      </td>
+                      <td style={{ padding: "7px 12px", color: C.dim }}>
+                        {s.source}{s.taken ? " · tomada" : ""}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div style={{
+            marginTop: 16, padding: 12, border: `1px dashed ${C.border}`, borderRadius: 4,
+            fontSize: 11, color: C.dim, lineHeight: 1.6,
+          }}>
+            El record vive en ESTE dispositivo/navegador (usa EXPORTAR como respaldo).
+            Resultados por regla fija: stop antes de TP1 = perdida (-1R); tras TP1 el stop pasa a
+            break-even; tramos 40/35/25 a 1R/1.8R/3R; 48h sin resolver = expirada.
+            El backtest no incluye comisiones, funding ni slippage: el win rate real sera algo menor.
+            Rendimiento pasado no garantiza resultados futuros.
+          </div>
         </>
       )}
     </div>
