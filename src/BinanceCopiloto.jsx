@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { fetchJson, fetchCandles, fmt, evaluate, analyzeTF } from "./signalCore.js";
+import { fetchJson, fetchCandles, fetchDepth, analyzeDepth, fmt, fmtQ, evaluate, analyzeTF } from "./signalCore.js";
 import { STABLES, assetCat, CAT_LABELS, SUBCAT_LABELS, subCat } from "./categories.js";
 import {
   recordSignal, markTaken, getSignals, probability, resolveOpenSignals,
@@ -158,16 +158,31 @@ export default function BinanceCopiloto() {
     setAnalyzing(true); setErr(null);
     try {
       const s = sym.toUpperCase().replace(/[/_]/g, "");
-      const [c15, c1h, c4h, cBtc] = await Promise.all([
+      const [c15, c1h, c4h, cBtc, depth] = await Promise.all([
         fetchCandles(s, "15m"), fetchCandles(s, "1h"), fetchCandles(s, "4h"),
         fetchCandles("BTCUSDT", "4h", 250),
+        fetchDepth(s).catch(() => null), // el libro es opcional: si falla, se analiza sin el
       ]);
-      setMarket({ symbol: s, time: new Date(), live: c15[c15.length - 1].close, c15, c1h, c4h, cBtc });
+      setMarket({
+        symbol: s, time: new Date(), live: c15[c15.length - 1].close,
+        c15, c1h, c4h, cBtc, depth, depthTime: depth ? new Date() : null,
+      });
       setTab("analyze");
     } catch (e) {
       setErr(`Error al analizar: ${e.message}`);
     }
     setAnalyzing(false);
+  };
+
+  const [depthBusy, setDepthBusy] = useState(false);
+  const refreshDepth = async () => {
+    if (!market || depthBusy) return;
+    setDepthBusy(true);
+    try {
+      const depth = await fetchDepth(market.symbol);
+      setMarket((m) => (m ? { ...m, depth, depthTime: new Date() } : m));
+    } catch { /* siguiente intento manual */ }
+    setDepthBusy(false);
   };
 
   // La senal se recalcula al instante al cambiar estrategia/indicadores/filtro.
@@ -191,6 +206,38 @@ export default function BinanceCopiloto() {
     );
     setLastRec(mine ? { id: mine.id, taken: mine.taken } : null);
   }, [analysis, market]);
+
+  const depthInfo = useMemo(
+    () => (market?.depth ? analyzeDepth(market.depth.bids, market.depth.asks, market.live) : null),
+    [market]
+  );
+
+  // Cruce del libro con el setup activo: muros dentro del recorrido o protegiendo el stop.
+  const wallNotes = useMemo(() => {
+    if (!depthInfo || !analysis?.dir || !analysis.tps?.length) return [];
+    const notes = [];
+    const tpMax = analysis.tps[analysis.tps.length - 1].price;
+    if (analysis.dir === "long") {
+      const enFrente = depthInfo.sellWalls.filter((w) => w.price > analysis.entry && w.price < tpMax);
+      if (enFrente.length) {
+        notes.push({ mala: true, t: `Muro de VENTA de ${fmtQ(enFrente[0].quote)} USDT en ${fmt(enFrente[0].price)} dentro del recorrido a tus TP - puede frenar el movimiento; considera tomar ganancia delante del muro.` });
+      }
+      const colchon = depthInfo.buyWalls.find((w) => w.price < analysis.entry && w.price > analysis.stop);
+      if (colchon) {
+        notes.push({ mala: false, t: `Muro de COMPRA de ${fmtQ(colchon.quote)} USDT en ${fmt(colchon.price)} entre tu entrada y tu stop - colchon de liquidez a favor.` });
+      }
+    } else {
+      const enFrente = depthInfo.buyWalls.filter((w) => w.price < analysis.entry && w.price > tpMax);
+      if (enFrente.length) {
+        notes.push({ mala: true, t: `Muro de COMPRA de ${fmtQ(enFrente[0].quote)} USDT en ${fmt(enFrente[0].price)} dentro del recorrido a tus TP - puede frenar la caida; considera tomar ganancia delante del muro.` });
+      }
+      const colchon = depthInfo.sellWalls.find((w) => w.price > analysis.entry && w.price < analysis.stop);
+      if (colchon) {
+        notes.push({ mala: false, t: `Muro de VENTA de ${fmtQ(colchon.quote)} USDT en ${fmt(colchon.price)} entre tu entrada y tu stop - colchon de liquidez a favor.` });
+      }
+    }
+    return notes;
+  }, [depthInfo, analysis]);
 
   const btcCtx = useMemo(() => {
     if (!market) return null;
@@ -696,6 +743,99 @@ export default function BinanceCopiloto() {
                   <span style={{ color: btcCtx.bias === "ALCISTA" ? C.green : btcCtx.bias === "BAJISTA" ? C.red : C.text }}>
                     {btcCtx.bias}
                   </span>{" "}· RSI {btcCtx.rsi?.toFixed(1)} - si BTC se mueve fuerte, arrastra la altcoin.
+                </div>
+              )}
+
+              {depthInfo && (
+                <div style={{
+                  background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4,
+                  padding: 14, marginBottom: 14,
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+                    <div style={{ color: C.amber, fontSize: 10, letterSpacing: "0.1em" }}>
+                      LIBRO DE ORDENES - mapa de liquidez EN VIVO (no vota en la senal)
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      {market?.depthTime && (
+                        <span style={{ color: C.dim, fontSize: 10 }}>
+                          {market.depthTime.toLocaleTimeString("es-CO")}
+                        </span>
+                      )}
+                      <button onClick={refreshDepth} disabled={depthBusy} style={{
+                        background: "transparent", border: `1px solid ${C.accent}`, color: C.accent,
+                        padding: "3px 10px", borderRadius: 3, cursor: "pointer", fontSize: 10, fontFamily: "inherit",
+                      }}>
+                        {depthBusy ? "..." : "REFRESCAR"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4 }}>
+                      <span style={{ color: C.green }}>
+                        Compra ±2%: {fmtQ(depthInfo.nearBid)} USDT ({(depthInfo.imbalance * 100).toFixed(0)}%)
+                      </span>
+                      <span style={{ color: C.red }}>
+                        Venta ±2%: {fmtQ(depthInfo.nearAsk)} USDT ({((1 - depthInfo.imbalance) * 100).toFixed(0)}%)
+                      </span>
+                    </div>
+                    <div style={{ height: 8, background: C.border, borderRadius: 4, overflow: "hidden", display: "flex" }}>
+                      <div style={{ width: `${depthInfo.imbalance * 100}%`, background: C.green }} />
+                      <div style={{ flex: 1, background: C.red }} />
+                    </div>
+                    <div style={{ color: C.dim, fontSize: 10, marginTop: 4 }}>
+                      {depthInfo.imbalance > 0.6
+                        ? "Domina la liquidez compradora cercana (posible soporte)."
+                        : depthInfo.imbalance < 0.4
+                          ? "Domina la liquidez vendedora cercana (posible techo)."
+                          : "Liquidez equilibrada cerca del precio."}
+                    </div>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 12 }}>
+                    <div>
+                      <div style={{ color: C.green, fontSize: 10, letterSpacing: "0.1em", marginBottom: 6 }}>
+                        MUROS DE COMPRA (donde se acumula la demanda)
+                      </div>
+                      {depthInfo.buyWalls.map((w, i) => (
+                        <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", fontSize: 12, borderTop: i ? `1px solid ${C.border}` : "none" }}>
+                          <span>{fmt(w.price)}</span>
+                          <span style={{ color: C.green, fontWeight: 600 }}>{fmtQ(w.quote)}</span>
+                          <span style={{ color: C.dim, fontSize: 11 }}>{w.distPct.toFixed(2)}%</span>
+                        </div>
+                      ))}
+                      {!depthInfo.buyWalls.length && <div style={{ color: C.dim, fontSize: 11 }}>Sin muros relevantes en ±5%.</div>}
+                    </div>
+                    <div>
+                      <div style={{ color: C.red, fontSize: 10, letterSpacing: "0.1em", marginBottom: 6 }}>
+                        MUROS DE VENTA (donde se acumula la oferta)
+                      </div>
+                      {depthInfo.sellWalls.map((w, i) => (
+                        <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", fontSize: 12, borderTop: i ? `1px solid ${C.border}` : "none" }}>
+                          <span>{fmt(w.price)}</span>
+                          <span style={{ color: C.red, fontWeight: 600 }}>{fmtQ(w.quote)}</span>
+                          <span style={{ color: C.dim, fontSize: 11 }}>+{w.distPct.toFixed(2)}%</span>
+                        </div>
+                      ))}
+                      {!depthInfo.sellWalls.length && <div style={{ color: C.dim, fontSize: 11 }}>Sin muros relevantes en ±5%.</div>}
+                    </div>
+                  </div>
+
+                  {wallNotes.length > 0 && (
+                    <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
+                      {wallNotes.map((n, i) => (
+                        <div key={i} style={{ fontSize: 11, lineHeight: 1.5, color: n.mala ? "#ffe9a8" : "#7fe8d0", marginBottom: 4 }}>
+                          {n.mala ? "⚠" : "✓"} {n.t}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={{ marginTop: 10, fontSize: 10, color: C.dim, lineHeight: 1.5 }}>
+                    Ordenes LIMITE en espera, no volumen ejecutado: los muros pueden retirarse en segundos
+                    (spoofing). Por eso el libro informa pero NO vota en la senal. Muros = bins de ~0.2%
+                    dentro de ±5% del precio; desequilibrio medido a ±2%.
+                  </div>
                 </div>
               )}
 

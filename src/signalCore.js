@@ -46,6 +46,50 @@ export async function fetchHistory(sym, interval, startTime) {
   return out;
 }
 
+/* ---------- LIBRO DE ORDENES (liquidez) ---------- */
+export async function fetchDepth(sym, limit = 1000) {
+  const d = await fetchJson(`/depth?symbol=${sym}&limit=${limit}`);
+  const toL = (r) => ({ price: +r[0], qty: +r[1] });
+  return { bids: d.bids.map(toL), asks: d.asks.map(toL) };
+}
+
+// Agrupa el libro en "muros": bins de ~0.2% del precio dentro de ±5%,
+// y mide el desequilibrio compra/venta en el rango cercano (±2%).
+export function analyzeDepth(bids, asks, mid, opts = {}) {
+  const { range = 0.05, near = 0.02, binPct = 0.002, topN = 4 } = opts;
+  const walls = (levels, side) => {
+    const bins = new Map();
+    for (const { price, qty } of levels) {
+      if (Math.abs(price - mid) / mid > range) continue;
+      const key = Math.round(price / (mid * binPct));
+      const b = bins.get(key) ?? { quote: 0, pxQ: 0 };
+      b.quote += price * qty;
+      b.pxQ += price * price * qty;
+      bins.set(key, b);
+    }
+    const ranked = [...bins.values()]
+      .map((b) => ({ price: b.pxQ / b.quote, quote: b.quote, side }))
+      .sort((a, b) => b.quote - a.quote);
+    const floor = ranked.length ? ranked[0].quote * 0.15 : 0; // descarta bins insignificantes
+    return ranked
+      .filter((w) => w.quote >= floor)
+      .slice(0, topN)
+      .map((w) => ({ ...w, distPct: ((w.price - mid) / mid) * 100 }))
+      .sort((a, b) => Math.abs(a.distPct) - Math.abs(b.distPct));
+  };
+  const nearBid = bids.filter((l) => l.price >= mid * (1 - near)).reduce((a, l) => a + l.price * l.qty, 0);
+  const nearAsk = asks.filter((l) => l.price <= mid * (1 + near)).reduce((a, l) => a + l.price * l.qty, 0);
+  return {
+    buyWalls: walls(bids, "buy"),
+    sellWalls: walls(asks, "sell"),
+    nearBid, nearAsk,
+    imbalance: nearBid + nearAsk > 0 ? nearBid / (nearBid + nearAsk) : 0.5,
+  };
+}
+
+export const fmtQ = (q) =>
+  q >= 1e6 ? `${(q / 1e6).toFixed(2)}M` : `${(q / 1e3).toFixed(0)}K`;
+
 export const fmt = (n) => {
   if (n == null || isNaN(n)) return "-";
   if (n >= 1000) return n.toFixed(2);
