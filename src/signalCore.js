@@ -1095,8 +1095,150 @@ export function buildAvwapSignal(c15, tf15, tf1h, tf4h, live, riskMode) {
   return packageSignal({ ...base, dir, confidence, core, warnings, invalidation, stopPrice, extra: { avwap: { low: avL, high: avH } } });
 }
 
+/* ---------- SESGO DE BTC (para el filtro de la META) ---------- */
+export function btcBiasSeries(c4h) {
+  const closes = c4h.map((c) => c.close);
+  const e50 = ema(closes, 50), e200 = ema(closes, 200);
+  return c4h.map((c, i) => ({
+    time: c.time,
+    bias: e50[i] != null && e200[i] != null
+      ? closes[i] > e50[i] && e50[i] > e200[i] ? 1
+        : closes[i] < e50[i] && e50[i] < e200[i] ? -1 : 0
+      : 0,
+  }));
+}
+
+// Sesgo de la ultima vela de 4h CERRADA antes del instante t.
+export function btcBiasAt(series, t) {
+  let lo = 0, hi = series.length - 1, ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (series[mid].time + 14400000 <= t) { ans = series[mid].bias; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  return ans;
+}
+
+/* ---------- ESTRATEGIA META FILTRADA ----------
+   Combina las 7 estrategias y solo deja pasar senales que superan los filtros
+   validados con el record real del usuario:
+   1) filtro BTC (no alt-largos con BTC bajista 4h, ni cortos con BTC alcista);
+   2) anti-persecucion (descarta la confianza ALTA-unanime de indicadores: 42% historico);
+   3) probabilidad historica >= 55% con n >= 30 (cuando hay funcion de probabilidad);
+   4) cortos con doble llave (ademas exigen estructura 1h bajista).
+   El 5o filtro (max 2 memes por direccion) se aplica en el escaner, entre simbolos. */
+const META_SUBS = ["indicadores", "estructura", "ichimoku", "keltner", "donchian", "supertrend", "avwap"];
+
+export function buildMetaSignal(c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts = {}) {
+  const { btcBias = null, probFn = null } = opts;
+  const bias = emaBias(t1h, t4h);
+  const A = t15.atr || live * 0.01;
+  const extATR = t15.atr ? (live - t15.ema21) / t15.atr : 0;
+  const vacio = (core, invalidation, blockedDir = null) => ({
+    modo: "meta", tipo: "meta-filtrada", bias, signal: "SIN OPERAR", dir: null, confidence: "-",
+    core, contexto: [], bull: 0, bear: 0, warnings: [], blockedDir, riskMode,
+    entry: null, zone: null, stop: null, tps: [], roomR: null, ceiling: null, maxLev: null,
+    invalidation, atrVal: A, extATR,
+  });
+
+  const candidates = [];
+  for (const st of META_SUBS) {
+    try {
+      const s = buildFor(st, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode);
+      if (s.dir) candidates.push({ st, sig: s });
+    } catch { /* estrategia sin datos suficientes */ }
+  }
+
+  const core = [];
+  core.push({
+    n: "Candidatas",
+    v: candidates.length
+      ? candidates.map((c) => `${c.st} ${c.sig.dir === "long" ? "↑" : "↓"}`).join(" · ")
+      : "ninguna de las 7 estrategias emite senal ahora",
+    d: "flat",
+  });
+  if (!candidates.length) {
+    return vacio(core, "Ninguna estrategia base tiene senal activa. La META no inventa entradas: espera.");
+  }
+
+  const dropped = [];
+  let pool = [];
+  const st1hTrend = structureEngine(c1hc).trend;
+
+  for (const c of candidates) {
+    // 2) anti-persecucion: ALTA-unanime de indicadores demostro 42% de aciertos
+    if (c.st === "indicadores" && c.sig.confidence === "ALTA") {
+      dropped.push(`${c.st} (ALTA-unanime = perseguir: 42% historico)`);
+      continue;
+    }
+    // 1) filtro BTC
+    if (btcBias === -1 && c.sig.dir === "long") { dropped.push(`${c.st} largo (BTC bajista 4h arrastra las alts)`); continue; }
+    if (btcBias === 1 && c.sig.dir === "short") { dropped.push(`${c.st} corto (BTC alcista 4h)`); continue; }
+    // 4) cortos con doble llave
+    if (c.sig.dir === "short" && st1hTrend !== -1) { dropped.push(`${c.st} corto (falta la 2a llave: estructura 1h no es bajista)`); continue; }
+    // 3) probabilidad historica como portero
+    let pr = null;
+    if (probFn) {
+      try { pr = probFn(c.sig); } catch { pr = null; }
+      if (pr && pr.n >= 30 && pr.p < 0.55) { dropped.push(`${c.st} (probabilidad ${(pr.p * 100).toFixed(0)}% < 55% con n=${pr.n})`); continue; }
+    }
+    pool.push({ ...c, pr });
+  }
+
+  core.push({
+    n: "Filtro BTC",
+    v: btcBias == null ? "Sin dato de BTC: filtro no aplicado esta vez"
+      : btcBias === 1 ? "BTC ALCISTA 4h: largos permitidos, cortos vetados"
+      : btcBias === -1 ? "BTC BAJISTA 4h: cortos permitidos, largos vetados"
+      : "BTC en rango: ambas direcciones permitidas",
+    d: btcBias === 1 ? "up" : btcBias === -1 ? "down" : "flat",
+  });
+  core.push({
+    n: "Descartes",
+    v: dropped.length ? dropped.join(" · ") : "ninguna candidata descartada por los filtros",
+    d: dropped.length ? "flat" : "up",
+  });
+
+  if (!pool.length) {
+    const dirs = candidates.map((c) => c.sig.dir);
+    const majority = dirs.filter((x) => x === "long").length >= dirs.length / 2 ? "long" : "short";
+    return vacio(core, `Hubo ${candidates.length} candidata(s) pero ninguna paso los filtros. Eso ES la estrategia: los filtros existen porque esas senales pierden dinero en tu record.`, majority);
+  }
+
+  const CONF_ORD = { ALTA: 3, MEDIA: 2, BAJA: 1 };
+  pool.sort((a, b) =>
+    ((b.pr?.p ?? 0.5) - (a.pr?.p ?? 0.5)) ||
+    ((CONF_ORD[b.sig.confidence] ?? 0) - (CONF_ORD[a.sig.confidence] ?? 0))
+  );
+  const winner = pool[0];
+  const consenso = pool.filter((c) => c.sig.dir === winner.sig.dir).length;
+
+  core.push({
+    n: "Ganadora",
+    v: `${winner.st} ${winner.sig.dir === "long" ? "LARGO" : "CORTO"}${winner.pr ? ` · prob ${(winner.pr.p * 100).toFixed(0)}% (n=${winner.pr.n})` : ""} · consenso: ${consenso} estrategia(s) en la misma direccion`,
+    d: winner.sig.dir === "long" ? "up" : "down",
+  });
+
+  const warnings = [...(winner.sig.warnings ?? [])];
+  if (winner.pr && winner.pr.n < 30) warnings.push(`Probabilidad con muestra insuficiente (n=${winner.pr.n}): el portero de probabilidad no pudo aplicarse. Corre el backtest para alimentarlo.`);
+  if (btcBias == null) warnings.push("Sin dato de BTC: el filtro 1 no se aplico en esta evaluacion.");
+
+  let confidence = "BAJA";
+  if (consenso >= 2 && winner.pr && winner.pr.p >= 0.6 && winner.pr.n >= 30) confidence = "ALTA";
+  else if (consenso >= 2 || (winner.pr && winner.pr.p >= 0.55 && winner.pr.n >= 30)) confidence = "MEDIA";
+
+  return {
+    ...winner.sig,
+    modo: "meta", tipo: "meta-filtrada", bias, confidence,
+    core, contexto: [], warnings, blockedDir: null, riskMode,
+    metaFuente: winner.st, metaConsenso: consenso,
+    metaProb: winner.pr ? { p: winner.pr.p, n: winner.pr.n } : null,
+  };
+}
+
 /* ---------- EVALUACION UNIFICADA ---------- */
 export const STRATEGIES = [
+  ["meta", "META FILTRADA"],
   ["indicadores", "INDICADORES"],
   ["estructura", "ESTRUCTURA"],
   ["ichimoku", "ICHIMOKU"],
@@ -1107,8 +1249,9 @@ export const STRATEGIES = [
 ];
 export const STRATEGY_KEYS = STRATEGIES.map(([k]) => k);
 
-function buildFor(strategy, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode) {
+function buildFor(strategy, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts = {}) {
   switch (strategy) {
+    case "meta": return buildMetaSignal(c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts);
     case "estructura": return buildStructureSignal(c15c, t15, c1hc, t1h, live, riskMode);
     case "ichimoku": return buildIchimokuSignal(c15c, t15, t1h, t4h, live, riskMode);
     case "keltner": return buildKeltnerSignal(c15c, t15, t1h, t4h, live, riskMode);
@@ -1121,18 +1264,19 @@ function buildFor(strategy, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode) {
 
 // Corre la estrategia activa sobre velas ya descargadas. `c15/c1h/c4h` incluyen
 // la vela en formacion; se analiza sobre velas cerradas y `live` es el ultimo precio.
-export function evaluate(c15, c1h, c4h, live, strategy, ind, riskMode) {
+// opts: { btcBias: -1|0|1|null, probFn: (sig)=>({p,n})|null } para la META.
+export function evaluate(c15, c1h, c4h, live, strategy, ind, riskMode, opts = {}) {
   const closed = (arr) => arr.slice(0, -1);
   const c15c = closed(c15), c1hc = closed(c1h);
   const t15 = analyzeTF(c15c);
   const t1h = analyzeTF(c1hc);
   const t4h = analyzeTF(closed(c4h));
-  const sig = buildFor(strategy, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode);
+  const sig = buildFor(strategy, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts);
   return { tf15: t15, tf1h: t1h, tf4h: t4h, ...sig };
 }
 
 // Corre TODAS las estrategias sobre las mismas velas (los analisis TF se computan una sola vez).
-export function evaluateAll(c15, c1h, c4h, live, ind, riskMode) {
+export function evaluateAll(c15, c1h, c4h, live, ind, riskMode, opts = {}) {
   const closed = (arr) => arr.slice(0, -1);
   const c15c = closed(c15), c1hc = closed(c1h);
   const t15 = analyzeTF(c15c);
@@ -1140,7 +1284,7 @@ export function evaluateAll(c15, c1h, c4h, live, ind, riskMode) {
   const t4h = analyzeTF(closed(c4h));
   return STRATEGY_KEYS.map((k) => {
     try {
-      return { strategy: k, sig: { tf15: t15, tf1h: t1h, tf4h: t4h, ...buildFor(k, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode) } };
+      return { strategy: k, sig: { tf15: t15, tf1h: t1h, tf4h: t4h, ...buildFor(k, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts) } };
     } catch {
       return { strategy: k, sig: null };
     }
@@ -1151,7 +1295,7 @@ export function evaluateAll(c15, c1h, c4h, live, ind, riskMode) {
 export const SUBCAT_KEYS = ["memes", "defi", "l1", "l2", "ia", "gaming", "exchange", "otras"];
 
 // Estrategias one-hot ("indicadores" es la base implicita: todas en 0).
-const STRAT_FEATURES = ["estructura", "ichimoku", "keltner", "donchian", "supertrend", "avwap"];
+const STRAT_FEATURES = ["estructura", "ichimoku", "keltner", "donchian", "supertrend", "avwap", "meta"];
 
 export const FEATURE_NAMES = [
   "sesgo", // bias

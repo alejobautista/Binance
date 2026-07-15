@@ -4,6 +4,7 @@
 
 import {
   fetchCandles, fetchHistory, evaluate, extractFeatures, segmentKeys,
+  btcBiasSeries, btcBiasAt,
 } from "./signalCore.js";
 import { loadModel, saveModel, train, trainBatch, predict, topFactors, resetModel } from "./model.js";
 import { subCat } from "./categories.js";
@@ -233,7 +234,8 @@ export function stats() {
 const H15 = 900000, H1 = 3600000, H4 = 14400000;
 
 // Genera senales sobre historico y las resuelve. Solo computa; no toca storage.
-export function backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode) {
+export function backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, opts = {}) {
+  const { btcSeries = null } = opts;
   const out = [];
   let j1 = -1, j4 = -1;
   let blockLong = -1, blockShort = -1;
@@ -250,7 +252,10 @@ export function backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode) {
     const live = c15[i + 1].open;
 
     let sig;
-    try { sig = evaluate(w15, w1, w4, live, strategy, ind, riskMode); } catch { continue; }
+    try {
+      const evalOpts = btcSeries ? { btcBias: btcBiasAt(btcSeries, decisionTime) } : {};
+      sig = evaluate(w15, w1, w4, live, strategy, ind, riskMode, evalOpts);
+    } catch { continue; }
     if (!sig.dir) continue;
     if (sig.dir === "long" && i <= blockLong) continue;
     if (sig.dir === "short" && i <= blockShort) continue;
@@ -283,6 +288,15 @@ export async function runBacktest({ symbols, strategy, ind, riskMode, days = 90,
   let totalSignals = 0, totalWins = 0, sumR = 0;
   const now = Date.now();
 
+  // La META necesita la historia de BTC 4h para su filtro de sesgo.
+  let btcSeries = null;
+  if (strategy === "meta") {
+    try {
+      const btc4h = await fetchHistory("BTCUSDT", "4h", now - days * 86400000 - 310 * H4);
+      btcSeries = btcBiasSeries(btc4h);
+    } catch { /* sin BTC: la META correra sin ese filtro y lo advierte */ }
+  }
+
   for (let si = 0; si < symbols.length; si++) {
     const sym = symbols[si];
     onProgress?.({ sym, done: si, total: symbols.length, fase: "descargando" });
@@ -299,7 +313,7 @@ export async function runBacktest({ symbols, strategy, ind, riskMode, days = 90,
 
     onProgress?.({ sym, done: si, total: symbols.length, fase: "evaluando" });
     await new Promise((r) => setTimeout(r, 0)); // cede el hilo a la UI
-    const recs = backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode);
+    const recs = backtestSymbol(sym, c15, c1h, c4h, strategy, ind, riskMode, { btcSeries });
 
     for (const rec of recs) {
       const win = rec.r > 0 ? 1 : 0;

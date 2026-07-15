@@ -33,7 +33,8 @@ const HELP = {
   donchian: "Sistema Turtle (Dennis/Eckhardt, 1983): comprar fuerza, vender debilidad. Entrada: CIERRE fuera del canal de 55 velas + ADX>25 + DMI a favor; volumen >150% de la media da conviccion. Stop inicial: 2 ATR (2N). Advertencia honesta: historicamente acierta solo 35-40% de las veces - gana porque los aciertos son 3-5 veces mas grandes que las perdidas, no por acertar mucho. Exige estomago para rachas perdedoras.",
   supertrend: "Confluencia de tres sistemas de Wilder/volatilidad: SuperTrend (10, 3.0) da direccion, ADX/DMI da fuerza (>25) y el Parabolic SAR acompana como trailing. Regla de oro: ADX<20 = sistema APAGADO (el 60% de los flips del SAR en rango pierden). El stop usa la linea SuperTrend/SAR, que se mueve con el precio.",
   avwap: "Flujo de dinero institucional (Brian Shannon): el VWAP anclado al minimo/maximo del swing muestra quien controla desde ese evento; CMF>+0.05 confirma acumulacion real y el MFI evita comprar sobrecompra de flujo. Filosofia: comprar fuerza DESPUES del retroceso, no perseguir extension (>2.5 ATR del ancla = advertencia). Dos cierres contra el AVWAP invalidan la tesis.",
-  senales: "Cada vez que escaneas, la app corre las 7 estrategias sobre los pares con mas volumen del filtro activo. Aqui aparece cada senal con la ESTRATEGIA que la pidio y su probabilidad historica. Todas se registran automaticamente en el Record y se verifican contra el precio real aunque tu no las operes - asi el motor aprende que estrategia funciona en que mercado.",
+  senales: "Cada vez que escaneas, la app corre las 8 estrategias sobre los pares con mas volumen del filtro activo. Aqui aparece cada senal con la ESTRATEGIA que la pidio y su probabilidad historica. Todas se registran automaticamente en el Record y se verifican contra el precio real aunque tu no las operes - asi el motor aprende que estrategia funciona en que mercado.",
+  meta: "Estrategia disenada con TU record real (9,241 senales analizadas). Corre las otras 7 y solo deja pasar lo que sobrevive a 5 filtros que atacan fugas medidas: (1) BTC bajista en 4h veta largos en alts (el 15/07 seis largos de memes cayeron juntos por esto) y BTC alcista veta cortos; (2) descarta la confianza ALTA-unanime de indicadores, que historicamente acierta solo 42% porque llega tarde; (3) exige probabilidad historica >=55% con n>=30 - el motor de aprendizaje actua de portero; (4) los cortos ademas exigen estructura 1h bajista (los cortos sueltos promedian -0.21R); (5) en el escaner, maximo 2 senales meta por direccion en memecoins. Cuando dice SIN OPERAR con candidatas descartadas, eso ES la estrategia funcionando.",
 };
 
 function Help({ k }) {
@@ -91,7 +92,7 @@ export default function BinanceCopiloto() {
   const [capital, setCapital] = useState(1000);
   const [riskPct, setRiskPct] = useState(1);
   const [minVol, setMinVol] = useState(1000000);
-  const [strategy, setStrategy] = useState("indicadores");
+  const [strategy, setStrategy] = useState("meta");
   const [ind, setInd] = useState({ emas: true, rsi: true, macd: true, boll: true });
   const [riskMode, setRiskMode] = useState("estricto");
   const [cat, setCat] = useState("todos");
@@ -174,18 +175,28 @@ export default function BinanceCopiloto() {
     if (!visibleTickers.length) { setTop3Sig([]); setScanSignals([]); setTop3Msg(null); return; }
     setTop3Busy(true); setTop3Msg(null);
     try {
+      // Sesgo de BTC una sola vez para el filtro de la META.
+      let scanBtcBias = null;
+      try {
+        const btc = await getCandlesCached("BTCUSDT");
+        const b = analyzeTF(btc.c4h.slice(0, -1));
+        scanBtcBias = b.ema50 && b.ema200
+          ? b.close > b.ema50 && b.ema50 > b.ema200 ? 1
+            : b.close < b.ema50 && b.ema50 < b.ema200 ? -1 : 0
+          : null;
+      } catch { /* sin BTC esta vez */ }
+
       const candidates = [...visibleTickers].sort((a, b) => b.quoteVol - a.quoteVol).slice(0, 12);
       const results = [];
-      let recorded = 0;
       for (let i = 0; i < candidates.length; i += 4) {
         const batch = candidates.slice(i, i + 4);
         const settled = await Promise.allSettled(batch.map(async (t) => {
           const { c15, c1h, c4h } = await getCandlesCached(t.symbol);
           const live = c15[c15.length - 1].close;
+          const opts = { btcBias: scanBtcBias, probFn: (s) => probability(s, t.symbol) };
           const rows = [];
-          for (const { strategy: st, sig } of evaluateAll(c15, c1h, c4h, live, ind, riskMode)) {
+          for (const { strategy: st, sig } of evaluateAll(c15, c1h, c4h, live, ind, riskMode, opts)) {
             if (!sig.dir) continue;
-            if (recordSignal(sig, t.symbol, live)) recorded++;
             rows.push({ symbol: t.symbol, live, strategy: st, sig, prob: probability(sig, t.symbol) });
           }
           return rows;
@@ -196,8 +207,21 @@ export default function BinanceCopiloto() {
         ((b.prob?.p ?? 0.5) - (a.prob?.p ?? 0.5)) ||
         ((CONF_RANK[b.sig.confidence] ?? 0) - (CONF_RANK[a.sig.confidence] ?? 0))
       );
-      setScanSignals(results);
-      setTop3Sig(results.slice(0, 3));
+      // Filtro 5 de la META: maximo 2 senales meta por direccion en memecoins
+      // (el 15/07 seis largos de memes a la vez eran la misma apuesta repetida).
+      const memeCount = { long: 0, short: 0 };
+      const kept = results.filter((r) => {
+        if (r.strategy !== "meta" || subCat(r.symbol) !== "memes") return true;
+        if (memeCount[r.sig.dir] >= 2) return false;
+        memeCount[r.sig.dir]++;
+        return true;
+      });
+      let recorded = 0;
+      for (const r of kept) {
+        if (recordSignal(r.sig, r.symbol, r.live)) recorded++;
+      }
+      setScanSignals(kept);
+      setTop3Sig(kept.slice(0, 3));
       if (recorded) setTrackerTick((t) => t + 1);
       if (!results.length) {
         setTop3Msg(`Ninguna de las 7 estrategias tiene senal activa en esta categoria ahora mismo. ${riskMode === "estricto" ? "Prueba el filtro FLEXIBLE para ver setups con advertencias." : "Esperar tambien es una posicion."}`);
@@ -271,12 +295,23 @@ export default function BinanceCopiloto() {
     setDepthBusy(false);
   };
 
+  // Sesgo de BTC en 4h (filtro 1 de la META).
+  const btcBiasNum = useMemo(() => {
+    if (!market?.cBtc?.length) return null;
+    const b = analyzeTF(market.cBtc.slice(0, -1));
+    return b.ema50 && b.ema200
+      ? b.close > b.ema50 && b.ema50 > b.ema200 ? 1
+        : b.close < b.ema50 && b.ema50 < b.ema200 ? -1 : 0
+      : null;
+  }, [market]);
+
   // La senal se recalcula al instante al cambiar estrategia/indicadores/filtro.
   const analysis = useMemo(() => {
     if (!market) return null;
-    const sig = evaluate(market.c15, market.c1h, market.c4h, market.live, strategy, ind, riskMode);
+    const opts = { btcBias: btcBiasNum, probFn: (s) => probability(s, market.symbol) };
+    const sig = evaluate(market.c15, market.c1h, market.c4h, market.live, strategy, ind, riskMode, opts);
     return { symbol: market.symbol, time: market.time, live: market.live, ...sig };
-  }, [market, strategy, ind, riskMode]);
+  }, [market, strategy, ind, riskMode, btcBiasNum]);
 
   const prob = useMemo(
     () => (analysis?.dir && market ? probability(analysis, market.symbol, market.time.getTime()) : null),
@@ -884,6 +919,18 @@ export default function BinanceCopiloto() {
                           Estructura 15m: {trendTxt(analysis.structure.trend)}
                           {analysis.lastEvent ? ` · ${analysis.lastEvent.type} hace ${analysis.lastEvent.age} velas` : ""}
                         </div>
+                      </>
+                    ) : analysis.modo === "meta" ? (
+                      <>
+                        <div style={{ color: C.dim, fontSize: 11 }}>
+                          BTC 4h: {btcBiasNum === 1 ? "ALCISTA" : btcBiasNum === -1 ? "BAJISTA" : btcBiasNum === 0 ? "RANGO" : "sin dato"} · sesgo par: {analysis.bias}
+                        </div>
+                        {analysis.dir && (
+                          <div style={{ color: C.dim, fontSize: 11 }}>
+                            Fuente: {analysis.metaFuente} · consenso: {analysis.metaConsenso}
+                            {analysis.metaProb ? ` · prob ${(analysis.metaProb.p * 100).toFixed(0)}% (n=${analysis.metaProb.n})` : ""}
+                          </div>
+                        )}
                       </>
                     ) : (
                       <div style={{ color: C.dim, fontSize: 11 }}>Sesgo 4h/1h (EMAs): {analysis.bias} · tipo: {analysis.tipo}</div>
