@@ -123,9 +123,10 @@ export function markTaken(id, taken = true) {
   if (s) { s.taken = taken; saveSignals(signals); }
 }
 
-// Guarda TU operacion real sobre una senal (entrada, margen y apalancamiento propios).
-// Con esto el Record calcula tu PnL real y detecta patrones de error de ejecucion.
-export function saveMyOp(id, { entry, margin, lev }) {
+// Guarda TU operacion real sobre una senal: entrada, margen, apalancamiento y,
+// opcionalmente, TU stop y TUS take profit (si en el exchange pusiste otros niveles).
+// Con esto el Record calcula tu PnL real con TUS niveles, no con los sugeridos.
+export function saveMyOp(id, { entry, margin, lev, stop, tps }) {
   const signals = getSignals();
   const s = signals.find((x) => x.id === id);
   if (!s) return false;
@@ -133,9 +134,32 @@ export function saveMyOp(id, { entry, margin, lev }) {
   s.myEntry = entry;
   s.myMargin = margin;
   s.myLev = lev;
+  const validStop = stop > 0 && (s.dir === "long" ? stop < entry : stop > entry);
+  s.myStop = validStop ? stop : null;
+  if (validStop && Array.isArray(tps)) {
+    const risk = Math.abs(entry - stop);
+    const pcts = [40, 35, 25];
+    const clean = tps.filter((p) => p > 0 && (s.dir === "long" ? p > entry : p < entry));
+    s.myTps = clean.length === 3
+      ? clean.map((p, i) => ({
+          pct: pcts[i],
+          price: p,
+          r: (s.dir === "long" ? p - entry : entry - p) / risk,
+        }))
+      : null;
+  } else {
+    s.myTps = null;
+  }
   saveSignals(signals);
   return true;
 }
+
+// Niveles efectivos de la operacion del usuario: los suyos si los guardo, si no los de la senal.
+export const myLevels = (s) => ({
+  entry: s.myEntry > 0 ? s.myEntry : s.entry,
+  stop: s.myStop > 0 ? s.myStop : s.stop,
+  tps: s.myTps?.length ? s.myTps : s.tps,
+});
 
 /* ---------- Resolucion de resultados ---------- */
 // Camina velas de 15m posteriores a la senal. Criterio conservador: si una vela
@@ -206,12 +230,13 @@ export async function resolveOpenSignals() {
       const res = resolveOutcome(s, candles);
       if (res) {
         Object.assign(s, { outcome: res.outcome, r: res.r, detail: res.detail, closedAt: res.closedAt });
-        // Si el usuario guardo SU operacion, resolvemos tambien desde SU entrada real.
+        // Si el usuario guardo SU operacion, resolvemos tambien con SUS niveles reales.
         if (s.myEntry > 0 && s.myMargin > 0 && s.myLev > 0) {
-          const mine = resolveOutcome({ ...s, entry: s.myEntry }, candles);
+          const lv = myLevels(s);
+          const mine = resolveOutcome({ dir: s.dir, ...lv }, candles);
           if (mine) {
             s.rMine = mine.r;
-            const riskPct = Math.abs(s.myEntry - s.stop) / s.myEntry;
+            const riskPct = Math.abs(lv.entry - lv.stop) / lv.entry;
             s.pnlUsdt = s.myMargin * s.myLev * riskPct * mine.r;
           }
         }

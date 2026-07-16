@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from "react"
 import { fetchJson, fetchCandles, fetchDepth, analyzeDepth, fmt, fmtQ, evaluate, evaluateAll, analyzeTF, STRATEGIES, HORIZONS, HORIZON_KEYS } from "./signalCore.js";
 import { STABLES, assetCat, CAT_LABELS, SUBCAT_LABELS, subCat } from "./categories.js";
 import {
-  recordSignal, markTaken, saveMyOp, getSignals, probability, resolveOpenSignals,
+  recordSignal, markTaken, saveMyOp, myLevels, getSignals, probability, resolveOpenSignals,
   stats as trackerStats, runBacktest, exportJSON, importJSON, clearAll, getBtSample,
 } from "./tracker.js";
 import { CandleChart, EquityCurve } from "./Chart.jsx";
@@ -428,6 +428,17 @@ export default function BinanceCopiloto() {
     [market]
   );
 
+  // BITACORA en el grafico: tus operaciones del par visible con niveles CONGELADOS.
+  // Abiertas → lineas fijas; cerradas → marcador con resultado en la vela de entrada.
+  const chartOps = useMemo(() => {
+    if (!market) return [];
+    const winStart = market.c15.length ? market.c15[Math.max(0, market.c15.length - 96)].time : 0;
+    return getSignals()
+      .filter((s) => s.symbol === market.symbol && s.taken)
+      .filter((s) => s.outcome === "open" || s.ts >= winStart)
+      .map((s) => ({ ...myLevels(s), dir: s.dir, outcome: s.outcome, r: s.rMine ?? s.r, ts: s.ts }));
+  }, [market, trackerTick]);
+
   // Cruce del libro con el setup activo: muros dentro del recorrido o protegiendo el stop.
   const wallNotes = useMemo(() => {
     if (!depthInfo || !analysis?.dir || !analysis.tps?.length) return [];
@@ -464,16 +475,25 @@ export default function BinanceCopiloto() {
     return { bias, price: btc.close, rsi: btc.rsi };
   }, [market]);
 
-  // MI POSICION: la operacion real del usuario (entrada, margen y apalancamiento propios).
+  // MI POSICION: la operacion real del usuario (entrada, stop, TPs, margen y apalancamiento propios).
   const [myEntry, setMyEntry] = useState("");
   const [myMargin, setMyMargin] = useState("");
   const [myLev, setMyLev] = useState("");
+  const [myStop, setMyStop] = useState("");
+  const [myTp1, setMyTp1] = useState("");
+  const [myTp2, setMyTp2] = useState("");
+  const [myTp3, setMyTp3] = useState("");
 
   // Prellenar con la sugerencia cuando aparece una senal nueva (otro par/direccion/estrategia).
+  // Todos los niveles son editables: si en Binance pusiste otros, corrigelos antes de guardar.
   useEffect(() => {
     if (analysis?.dir && analysis.entry) {
       setMyEntry(String(analysis.entry));
       setMyLev(String(analysis.maxLev ?? 1));
+      setMyStop(analysis.stop != null ? String(analysis.stop) : "");
+      setMyTp1(analysis.tps?.[0] ? String(analysis.tps[0].price) : "");
+      setMyTp2(analysis.tps?.[1] ? String(analysis.tps[1].price) : "");
+      setMyTp3(analysis.tps?.[2] ? String(analysis.tps[2].price) : "");
     }
   }, [analysis?.symbol, analysis?.dir, analysis?.modo]);
 
@@ -482,10 +502,14 @@ export default function BinanceCopiloto() {
     const e = parseFloat(myEntry), m = parseFloat(myMargin), L = parseFloat(myLev);
     if (!(e > 0) || !(m > 0) || !(L > 0)) return null;
     const isLong = analysis.dir === "long";
+    // Ratios calculados con TUS niveles (editables), no con los vivos de la senal.
+    const stop = parseFloat(myStop) > 0 ? parseFloat(myStop) : analysis.stop;
+    const tpPrices = [myTp1, myTp2, myTp3].map(parseFloat);
+    const baseTps = analysis.tps.map((tp, i) => (tpPrices[i] > 0 ? { ...tp, price: tpPrices[i] } : tp));
     const size = m * L;
-    const riskPct = isLong ? (e - analysis.stop) / e : (analysis.stop - e) / e;
+    const riskPct = isLong ? (e - stop) / e : (stop - e) / e;
     if (riskPct <= 0) return { invalid: true };
-    const tps = analysis.tps.map((tp) => {
+    const tps = baseTps.map((tp) => {
       const gainPct = isLong ? (tp.price - e) / e : (e - tp.price) / e;
       return { ...tp, rReal: gainPct / riskPct, pnl: size * gainPct * (tp.pct / 100) };
     });
@@ -493,14 +517,14 @@ export default function BinanceCopiloto() {
     return {
       size, coins: size / e, riskPct,
       riskUsdt: size * riskPct,
-      tps,
+      tps, stop,
       pnlTotal: tps.reduce((a, t) => a + t.pnl, 0),
       weightedR: tps.reduce((a, t) => a + (t.pct / 100) * t.rReal, 0),
       liqPrice,
-      liqSafe: isLong ? liqPrice < analysis.stop : liqPrice > analysis.stop,
+      liqSafe: isLong ? liqPrice < stop : liqPrice > stop,
       slipPct: ((isLong ? e - analysis.entry : analysis.entry - e) / analysis.entry) * 100,
     };
-  }, [analysis, myEntry, myMargin, myLev]);
+  }, [analysis, myEntry, myMargin, myLev, myStop, myTp1, myTp2, myTp3]);
 
   const position = useMemo(() => {
     if (!analysis?.dir || !analysis.entry || !analysis.stop) return null;
@@ -642,6 +666,14 @@ export default function BinanceCopiloto() {
   // Posiciones vivas: senales marcadas "la tome" que siguen abiertas.
   const openTaken = useMemo(
     () => getSignals().filter((s) => s.taken && s.outcome === "open"),
+    [trackerTick, tab]
+  );
+  // Bitacora: tus operaciones ya cerradas (las mas recientes primero).
+  const closedTaken = useMemo(
+    () => getSignals()
+      .filter((s) => s.taken && s.outcome !== "open" && (s.rMine ?? s.r) != null)
+      .sort((a, b) => (b.closedAt ?? b.ts) - (a.closedAt ?? a.ts))
+      .slice(0, 20),
     [trackerTick, tab]
   );
   const [posPx, setPosPx] = useState({});
@@ -1138,12 +1170,19 @@ export default function BinanceCopiloto() {
                       </button>
                     </div>
                   </div>
-                  <CandleChart candles={market.c15} sig={analysis} depthInfo={depthInfo} />
+                  <CandleChart candles={market.c15} sig={analysis} depthInfo={depthInfo} ops={chartOps} />
                   <div style={{ color: C.dim, fontSize: 10, marginTop: 6, lineHeight: 1.5 }}>
                     <span style={{ color: C.amber }}>—</span> EMA9 · <span style={{ color: C.accent }}>—</span> EMA21 ·{" "}
-                    <span style={{ color: "#9aa4b2" }}>—</span> EMA50 · punteadas: IN/SL/TP · franjas: muros del libro ·
-                    volumen verde/rojo segun quien ejecuto mas.
+                    <span style={{ color: "#9aa4b2" }}>—</span> EMA50 · punteadas: IN/SL/TP de la senal viva ·
+                    solidas <span style={{ color: "#a78bfa" }}>MI IN</span>/MI SL/MI TP: tu operacion guardada (NO se mueven) ·
+                    ✓/✗: tus operaciones cerradas · franjas: muros del libro.
                   </div>
+                  {chartOps.some((o) => o.outcome === "open") && (
+                    <div style={{ color: "#a78bfa", fontSize: 11, marginTop: 4, lineHeight: 1.5 }}>
+                      Tienes una operacion abierta en este par: sus niveles estan congelados en tu bitacora y no
+                      cambian aunque la senal viva cambie o pase a SIN OPERAR.
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1554,6 +1593,24 @@ export default function BinanceCopiloto() {
                         <input type="number" value={myLev} onChange={(e) => setMyLev(e.target.value)} style={{ ...inputS, width: "100%" }} />
                       </div>
                     </div>
+                    <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+                      <div style={{ flex: "1 1 100px" }}>
+                        <div style={{ color: C.red, fontSize: 10, marginBottom: 4 }}>MI STOP</div>
+                        <input type="number" value={myStop} onChange={(e) => setMyStop(e.target.value)} style={{ ...inputS, width: "100%" }} />
+                      </div>
+                      <div style={{ flex: "1 1 90px" }}>
+                        <div style={{ color: C.green, fontSize: 10, marginBottom: 4 }}>MI TP1</div>
+                        <input type="number" value={myTp1} onChange={(e) => setMyTp1(e.target.value)} style={{ ...inputS, width: "100%" }} />
+                      </div>
+                      <div style={{ flex: "1 1 90px" }}>
+                        <div style={{ color: C.green, fontSize: 10, marginBottom: 4 }}>MI TP2</div>
+                        <input type="number" value={myTp2} onChange={(e) => setMyTp2(e.target.value)} style={{ ...inputS, width: "100%" }} />
+                      </div>
+                      <div style={{ flex: "1 1 90px" }}>
+                        <div style={{ color: C.green, fontSize: 10, marginBottom: 4 }}>MI TP3</div>
+                        <input type="number" value={myTp3} onChange={(e) => setMyTp3(e.target.value)} style={{ ...inputS, width: "100%" }} />
+                      </div>
+                    </div>
 
                     {!myPos && (
                       <div style={{ color: C.dim, fontSize: 12, lineHeight: 1.6 }}>
@@ -1603,7 +1660,7 @@ export default function BinanceCopiloto() {
                             borderRadius: 4, fontSize: 11, lineHeight: 1.5, color: "#ffb3c0",
                           }}>
                             PELIGRO: con {(+myLev).toFixed(0)}x tu liquidacion ({fmt(myPos.liqPrice)}) queda ANTES
-                            del stop ({fmt(analysis.stop)}): perderias TODO el margen antes de que el stop te proteja.
+                            del stop ({fmt(myPos.stop)}): perderias TODO el margen antes de que el stop te proteja.
                             Baja el apalancamiento a maximo {analysis.maxLev}x.
                           </div>
                         )}
@@ -1631,7 +1688,10 @@ export default function BinanceCopiloto() {
                         </div>
                         {lastRec && (
                           <button onClick={() => {
-                            if (saveMyOp(lastRec.id, { entry: +myEntry, margin: +myMargin, lev: +myLev })) {
+                            if (saveMyOp(lastRec.id, {
+                              entry: +myEntry, margin: +myMargin, lev: +myLev,
+                              stop: +myStop, tps: [+myTp1, +myTp2, +myTp3],
+                            })) {
                               setLastRec({ ...lastRec, taken: true, saved: true });
                               setTrackerTick((t) => t + 1);
                             }
@@ -1648,8 +1708,8 @@ export default function BinanceCopiloto() {
                         )}
                         {lastRec && !lastRec.saved && (
                           <div style={{ marginTop: 6, fontSize: 10, color: C.dim, lineHeight: 1.5 }}>
-                            Al guardarla, el Record seguira TU operacion con TU entrada, calculara tu PnL real
-                            al resolverse y detectara tus patrones de error de ejecucion.
+                            Al guardarla entra a tu BITACORA: tus niveles quedan CONGELADOS (no cambian aunque
+                            la senal viva cambie), se dibujan en el grafico y el Record calcula tu PnL real al resolverse.
                           </div>
                         )}
                       </>
@@ -1901,60 +1961,110 @@ export default function BinanceCopiloto() {
             </div>
           )}
 
-          {openTaken.length > 0 && (
+          {(openTaken.length > 0 || closedTaken.length > 0) && (
             <>
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
                 <div style={{ color: C.amber, fontSize: 11, letterSpacing: "0.1em" }}>
-                  MIS POSICIONES ABIERTAS ({openTaken.length})<Help k="posiciones" />
+                  BITACORA DE OPERACIONES - abiertas ({openTaken.length})<Help k="posiciones" />
                 </div>
-                <button onClick={refreshPositions} disabled={posBusy} style={{
-                  background: "transparent", border: `1px solid ${C.accent}`, color: C.accent,
-                  padding: "4px 10px", borderRadius: 3, cursor: "pointer", fontSize: 10, fontFamily: "inherit",
-                }}>
-                  {posBusy ? "..." : "REFRESCAR PRECIOS"}
-                </button>
+                {openTaken.length > 0 && (
+                  <button onClick={refreshPositions} disabled={posBusy} style={{
+                    background: "transparent", border: `1px solid ${C.accent}`, color: C.accent,
+                    padding: "4px 10px", borderRadius: 3, cursor: "pointer", fontSize: 10, fontFamily: "inherit",
+                  }}>
+                    {posBusy ? "..." : "REFRESCAR PRECIOS"}
+                  </button>
+                )}
+                <span style={{ color: C.dim, fontSize: 10 }}>
+                  niveles congelados al guardar; se dibujan en el grafico del par
+                </span>
               </div>
-              <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, overflow: "auto", marginBottom: 16 }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                  <thead>
-                    <tr style={{ background: C.panel2 }}>
-                      {["PAR", "DIR", "ENTRADA", "AHORA", "AVANCE", "ESTADO"].map((h) => (
-                        <th key={h} style={{ padding: "8px 12px", textAlign: "left", color: C.dim, fontSize: 10, fontWeight: 500 }}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {openTaken.map((s) => {
-                      const px = posPx[s.symbol];
-                      const risk = Math.abs(s.entry - s.stop) || 1;
-                      const adv = px != null ? (s.dir === "long" ? px - s.entry : s.entry - px) / risk : null;
-                      const tp1 = s.tps?.[0]?.price;
-                      const hitTp1 = px != null && tp1 != null && (s.dir === "long" ? px >= tp1 : px <= tp1);
-                      const nearStop = adv != null && adv <= -0.7;
-                      return (
-                        <tr key={s.id} style={{ borderTop: `1px solid ${C.border}` }}>
-                          <td style={{ padding: "7px 12px", fontWeight: 600 }}>{s.symbol}</td>
-                          <td style={{ padding: "7px 12px", color: s.dir === "long" ? C.green : C.red }}>
-                            {s.dir === "long" ? "LARGO" : "CORTO"}
-                          </td>
-                          <td style={{ padding: "7px 12px" }}>{fmt(s.entry)}</td>
-                          <td style={{ padding: "7px 12px" }}>{px != null ? fmt(px) : "-"}</td>
-                          <td style={{ padding: "7px 12px", color: adv == null ? C.dim : adv >= 0 ? C.green : C.red }}>
-                            {adv != null ? `${adv >= 0 ? "+" : ""}${adv.toFixed(2)}R` : "-"}
-                          </td>
-                          <td style={{ padding: "7px 12px", fontSize: 11, color: hitTp1 ? C.green : nearStop ? C.red : C.dim }}>
-                            {adv == null ? "sin precio"
-                              : adv <= -1 ? "stop tocado? VERIFICAR RESULTADOS"
-                              : hitTp1 ? `TP1 alcanzado: mueve stop a BE (${fmt(s.entry)})`
-                              : nearStop ? `cerca del stop ${fmt(s.stop)}`
-                              : `stop ${fmt(s.stop)} · TP1 ${fmt(tp1)}`}
-                          </td>
+              {openTaken.length > 0 && (
+                <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, overflow: "auto", marginBottom: 16 }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                    <thead>
+                      <tr style={{ background: C.panel2 }}>
+                        {["PAR", "DIR", "ENTRADA", "AHORA", "AVANCE", "ESTADO"].map((h) => (
+                          <th key={h} style={{ padding: "8px 12px", textAlign: "left", color: C.dim, fontSize: 10, fontWeight: 500 }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {openTaken.map((s) => {
+                        const lv = myLevels(s);
+                        const px = posPx[s.symbol];
+                        const risk = Math.abs(lv.entry - lv.stop) || 1;
+                        const adv = px != null ? (s.dir === "long" ? px - lv.entry : lv.entry - px) / risk : null;
+                        const tp1 = lv.tps?.[0]?.price;
+                        const hitTp1 = px != null && tp1 != null && (s.dir === "long" ? px >= tp1 : px <= tp1);
+                        const nearStop = adv != null && adv <= -0.7;
+                        return (
+                          <tr key={s.id} style={{ borderTop: `1px solid ${C.border}` }}>
+                            <td style={{ padding: "7px 12px", fontWeight: 600 }}>{s.symbol}</td>
+                            <td style={{ padding: "7px 12px", color: s.dir === "long" ? C.green : C.red }}>
+                              {s.dir === "long" ? "LARGO" : "CORTO"}
+                            </td>
+                            <td style={{ padding: "7px 12px" }}>{fmt(lv.entry)}</td>
+                            <td style={{ padding: "7px 12px" }}>{px != null ? fmt(px) : "-"}</td>
+                            <td style={{ padding: "7px 12px", color: adv == null ? C.dim : adv >= 0 ? C.green : C.red }}>
+                              {adv != null ? `${adv >= 0 ? "+" : ""}${adv.toFixed(2)}R` : "-"}
+                            </td>
+                            <td style={{ padding: "7px 12px", fontSize: 11, color: hitTp1 ? C.green : nearStop ? C.red : C.dim }}>
+                              {adv == null ? "sin precio"
+                                : adv <= -1 ? "stop tocado? VERIFICAR RESULTADOS"
+                                : hitTp1 ? `TP1 alcanzado: mueve stop a BE (${fmt(lv.entry)})`
+                                : nearStop ? `cerca del stop ${fmt(lv.stop)}`
+                                : `stop ${fmt(lv.stop)} · TP1 ${fmt(tp1)}`}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {closedTaken.length > 0 && (
+                <>
+                  <div style={{ color: C.dim, fontSize: 11, letterSpacing: "0.1em", marginBottom: 10 }}>
+                    BITACORA - CERRADAS RECIENTES ({closedTaken.length})
+                  </div>
+                  <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 4, overflow: "auto", marginBottom: 16 }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                      <thead>
+                        <tr style={{ background: C.panel2 }}>
+                          {["PAR", "DIR", "ENTRADA", "STOP", "RESULTADO", "FECHA"].map((h) => (
+                            <th key={h} style={{ padding: "8px 12px", textAlign: "left", color: C.dim, fontSize: 10, fontWeight: 500 }}>{h}</th>
+                          ))}
                         </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+                      </thead>
+                      <tbody>
+                        {closedTaken.map((s) => {
+                          const lv = myLevels(s);
+                          const rr = s.rMine ?? s.r;
+                          return (
+                            <tr key={s.id} style={{ borderTop: `1px solid ${C.border}` }}>
+                              <td style={{ padding: "7px 12px", fontWeight: 600 }}>{s.symbol}</td>
+                              <td style={{ padding: "7px 12px", color: s.dir === "long" ? C.green : C.red }}>
+                                {s.dir === "long" ? "LARGO" : "CORTO"}
+                              </td>
+                              <td style={{ padding: "7px 12px" }}>{fmt(lv.entry)}</td>
+                              <td style={{ padding: "7px 12px" }}>{fmt(lv.stop)}</td>
+                              <td style={{ padding: "7px 12px", color: rr > 0 ? C.green : C.red, fontWeight: 600 }}>
+                                {rr > 0 ? "✓" : "✗"} {rr >= 0 ? "+" : ""}{rr.toFixed(2)}R
+                                {s.pnlUsdt != null && ` · ${s.pnlUsdt >= 0 ? "+" : ""}${s.pnlUsdt.toFixed(2)} USDT`}
+                                {s.detail ? ` (${s.detail})` : ""}
+                              </td>
+                              <td style={{ padding: "7px 12px", color: C.dim, fontSize: 11 }}>
+                                {new Date(s.closedAt ?? s.ts).toLocaleDateString("es-CO", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
             </>
           )}
 

@@ -3,11 +3,12 @@ import { ema, structureEngine, fmt, fmtQ } from "./signalCore.js";
 
 const COL = {
   green: "#00d4aa", red: "#ff4d6d", amber: "#fbbf24", accent: "#3b82f6",
-  dim: "#6b7280", border: "#1f2937", text: "#e5e7eb",
+  violet: "#a78bfa", dim: "#6b7280", border: "#1f2937", text: "#e5e7eb",
 };
 
-/* Grafico de velas SVG: velas 15m cerradas + EMAs + pivotes + niveles del setup + muros. */
-export function CandleChart({ candles, sig, depthInfo }) {
+/* Grafico de velas SVG: velas 15m cerradas + EMAs + pivotes + niveles del setup + muros
+   + bitacora del usuario (ops abiertas con lineas fijas, cerradas con marcador de resultado). */
+export function CandleChart({ candles, sig, depthInfo, ops }) {
   const model = useMemo(() => {
     if (!candles || candles.length < 30) return null;
     const N = 96;
@@ -32,12 +33,35 @@ export function CandleChart({ candles, sig, depthInfo }) {
       levels.push({ p: sig.stop, label: "SL", color: COL.red, dash: "5,4" });
       (sig.tps ?? []).forEach((t, i) => levels.push({ p: t.price, label: `TP${i + 1}`, color: COL.green, dash: "5,4" }));
     }
-    for (const l of levels) {
+    // bitacora: ops ABIERTAS del par se dibujan con lineas solidas que NO se mueven
+    const opLevels = [];
+    for (const op of ops ?? []) {
+      if (op.outcome !== "open") continue;
+      opLevels.push({ p: op.entry, label: "MI IN", color: COL.violet });
+      opLevels.push({ p: op.stop, label: "MI SL", color: COL.red });
+      (op.tps ?? []).forEach((t, i) => opLevels.push({ p: t.price, label: `MI TP${i + 1}`, color: COL.green }));
+    }
+    for (const l of [...levels, ...opLevels]) {
       if (l.p > hi && l.p < hi + range0 * 0.6) hi = l.p;
       if (l.p < lo && l.p > lo - range0 * 0.6) lo = l.p;
     }
     const pad = (hi - lo) * 0.05;
     hi += pad; lo -= pad;
+
+    // ops CERRADAS: marcador en la vela donde se abrio (si cae en la ventana visible)
+    const closedMarks = [];
+    for (const op of ops ?? []) {
+      if (op.outcome === "open" || op.r == null) continue;
+      let idx = -1;
+      for (let i = 0; i < data.length; i++) {
+        if (op.ts >= data[i].time && (i === data.length - 1 || op.ts < data[i + 1].time)) { idx = i; break; }
+      }
+      if (idx < 0) continue;
+      closedMarks.push({
+        i: idx, dir: op.dir, price: op.entry, r: op.r,
+        win: op.r > 0,
+      });
+    }
 
     const walls = depthInfo
       ? [...depthInfo.buyWalls.map((w) => ({ ...w, color: COL.green })),
@@ -45,11 +69,11 @@ export function CandleChart({ candles, sig, depthInfo }) {
           .filter((w) => w.price > lo && w.price < hi)
       : [];
 
-    return { data, off, emas, pivots, lo, hi, levels, walls };
-  }, [candles, sig, depthInfo]);
+    return { data, off, emas, pivots, lo, hi, levels, opLevels, closedMarks, walls };
+  }, [candles, sig, depthInfo, ops]);
 
   if (!model) return null;
-  const { data, off, emas, pivots, lo, hi, levels, walls } = model;
+  const { data, off, emas, pivots, lo, hi, levels, opLevels, closedMarks, walls } = model;
 
   const W = 800, H = 320, VH = 42, PADT = 10, PADR = 74;
   const plotH = H - VH - PADT - 6;
@@ -138,6 +162,34 @@ export function CandleChart({ candles, sig, depthInfo }) {
           </text>
         </g>
       ))}
+
+      {/* bitacora: niveles FIJOS de tus operaciones abiertas (linea solida gruesa) */}
+      {opLevels.map((l, i) => (
+        <g key={`o${i}`}>
+          <line x1={0} x2={W - PADR} y1={Y(l.p)} y2={Y(l.p)} stroke={l.color} strokeWidth="2" opacity="0.75" />
+          <text x={4} y={Y(l.p) - 3} fill={l.color} fontSize="10" fontWeight="700" fontFamily="inherit">
+            {l.label} {fmt(l.p)}
+          </text>
+        </g>
+      ))}
+
+      {/* bitacora: operaciones cerradas (marcador con resultado en la vela de entrada) */}
+      {closedMarks.map((m, i) => {
+        const col = m.win ? COL.green : COL.red;
+        const y = Y(m.price);
+        const pts = m.dir === "long"
+          ? `${X(m.i) - 5},${y + 8} ${X(m.i) + 5},${y + 8} ${X(m.i)},${y}`
+          : `${X(m.i) - 5},${y - 8} ${X(m.i) + 5},${y - 8} ${X(m.i)},${y}`;
+        return (
+          <g key={`cm${i}`}>
+            <polygon points={pts} fill={col} opacity="0.95" />
+            <text x={X(m.i)} y={m.dir === "long" ? y + 22 : y - 14} fill={col} fontSize="10"
+              fontWeight="700" textAnchor="middle" fontFamily="inherit">
+              {m.win ? "✓" : "✗"} {m.r >= 0 ? "+" : ""}{m.r.toFixed(1)}R
+            </text>
+          </g>
+        );
+      })}
 
       {/* volumen coloreado por delta ejecutado */}
       {data.map((c, i) => {
