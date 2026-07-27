@@ -1,6 +1,11 @@
 /* Motor de senales puro (sin React): indicadores, estructura, niveles y evaluacion.
    Reutilizado por la UI, el Top 3 del escaner y el backtest. */
 
+// La estrategia de patrones vive en sus propios modulos (detector + cerebro dedicado).
+// El ciclo de imports es intencional y seguro: patternCore solo usa los indicadores de
+// este archivo DENTRO de funciones, nunca al evaluar el modulo.
+import { buildPatternSignal } from "./patternSignal.js";
+
 const BASES = [
   "https://api.binance.com/api/v3",
   "https://data-api.binance.vision/api/v3",
@@ -1274,6 +1279,7 @@ export const STRATEGIES = [
   ["donchian", "DONCHIAN 55"],
   ["supertrend", "SUPERTREND"],
   ["avwap", "AVWAP FLUJO"],
+  ["patrones", "PATRONES 🧠"],
 ];
 export const STRATEGY_KEYS = STRATEGIES.map(([k]) => k);
 
@@ -1286,6 +1292,7 @@ function buildFor(strategy, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts
     case "donchian": return buildDonchianSignal(c15c, t15, t1h, t4h, live, riskMode);
     case "supertrend": return buildSupertrendSignal(c15c, t15, t1h, t4h, live, riskMode);
     case "avwap": return buildAvwapSignal(c15c, t15, t1h, t4h, live, riskMode);
+    case "patrones": return buildPatternSignal(c15c, t15, t1h, t4h, live, riskMode, opts);
     default: return buildIndicatorSignal(t15, t1h, t4h, live, ind, riskMode);
   }
 }
@@ -1314,8 +1321,11 @@ export function evaluateAll(c15, c1h, c4h, live, ind, riskMode, opts = {}) {
   const base = { tf15: t15, tf1h: t1h, tf4h: t4h, tf: opts.tfLabel ?? "15m" };
   const results = [];
   const candidates = [];
+  // `skip` evita computar estrategias que el llamante va a descartar igual (el detector de
+  // patrones es el mas caro: reconstruye su contexto entero en cada ventana).
+  const skip = new Set(opts.skip ?? []);
   for (const k of STRATEGY_KEYS) {
-    if (k === "meta") continue;
+    if (k === "meta" || skip.has(k)) continue;
     try {
       const s = buildFor(k, c15c, t15, c1hc, t1h, t4h, live, ind, riskMode, opts);
       results.push({ strategy: k, sig: { ...base, ...s } });

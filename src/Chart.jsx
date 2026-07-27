@@ -69,11 +69,34 @@ export function CandleChart({ candles, sig, depthInfo, ops }) {
           .filter((w) => w.price > lo && w.price < hi)
       : [];
 
-    return { data, off, emas, pivots, lo, hi, levels, opLevels, closedMarks, walls };
+    // Geometria de la figura chartista: los indices vienen referidos a las velas CERRADAS
+    // que analizo el detector, asi que se traducen a la ventana visible del grafico.
+    // El detector corre sobre candles.slice(0,-1); la vela viva no desplaza los indices.
+    let pattern = null;
+    if (sig?.pattern?.lines || sig?.pattern?.fill) {
+      const p = sig.pattern;
+      const seg = (s) => (s ? { x1: s[0] - off, y1: s[1], x2: s[2] - off, y2: s[3] } : null);
+      const segs = [seg(p.lines?.u), seg(p.lines?.l), seg(p.fill?.u), seg(p.fill?.l)]
+        .filter((s) => s && s.x2 > 0 && s.x1 < data.length && s.y1 != null && s.y2 != null);
+      // Deduplica: fill y lines suelen compartir la misma recta.
+      const uniq = [];
+      for (const s of segs) {
+        if (!uniq.some((u) => Math.abs(u.x1 - s.x1) < 0.5 && Math.abs(u.y1 - s.y1) < 1e-9 &&
+                              Math.abs(u.x2 - s.x2) < 0.5 && Math.abs(u.y2 - s.y2) < 1e-9)) uniq.push(s);
+      }
+      if (uniq.length) {
+        pattern = {
+          segs: uniq, name: p.name, bull: p.isBullish,
+          brkX: p.breakoutIdx - off,
+        };
+      }
+    }
+
+    return { data, off, emas, pivots, lo, hi, levels, opLevels, closedMarks, walls, pattern };
   }, [candles, sig, depthInfo, ops]);
 
   if (!model) return null;
-  const { data, off, emas, pivots, lo, hi, levels, opLevels, closedMarks, walls } = model;
+  const { data, off, emas, pivots, lo, hi, levels, opLevels, closedMarks, walls, pattern } = model;
 
   const W = 800, H = 320, VH = 42, PADT = 10, PADR = 74;
   const plotH = H - VH - PADT - 6;
@@ -151,6 +174,28 @@ export function CandleChart({ candles, sig, depthInfo, ops }) {
           </text>
         );
       })}
+
+      {/* figura chartista detectada (rectas del patron + marca de la ruptura) */}
+      {pattern && (
+        <g>
+          {pattern.segs.map((s, i) => (
+            <line key={`pt${i}`}
+              x1={X(Math.max(0, s.x1))} y1={Yc(s.y1)}
+              x2={X(Math.min(data.length - 1, s.x2))} y2={Yc(s.y2)}
+              stroke={pattern.bull ? COL.green : COL.red}
+              strokeWidth="1.6" opacity="0.75" strokeDasharray="6,3" />
+          ))}
+          {pattern.brkX >= 0 && pattern.brkX < data.length && (
+            <line x1={X(pattern.brkX)} x2={X(pattern.brkX)} y1={PADT} y2={PADT + plotH}
+              stroke={COL.violet} strokeWidth="1" opacity="0.5" strokeDasharray="2,4" />
+          )}
+          <text x={X(Math.max(0, Math.min(data.length - 1, pattern.brkX)))} y={PADT + 12}
+            fill={pattern.bull ? COL.green : COL.red} fontSize="10" fontWeight="700"
+            textAnchor="end" fontFamily="inherit">
+            {pattern.name}
+          </text>
+        </g>
+      )}
 
       {/* niveles del setup */}
       {levels.map((l, i) => (

@@ -4,15 +4,21 @@
 
 import {
   fetchCandles, fetchHistory, evaluate, evaluateAll, extractFeatures, segmentKeys,
-  btcBiasSeries, btcBiasAt,
+  btcBiasSeries, btcBiasAt, STRATEGY_KEYS,
 } from "./signalCore.js";
 import { loadModel, saveModel, train, trainBatch, predict, topFactors, resetModel } from "./model.js";
+import {
+  harvestShadowTrades, trainFromHarvest, brainTotals,
+  getPatternBrain, setPatternBrain, reloadPatternBrain,
+} from "./patternTracker.js";
+import { resetBrain, brainState } from "./patternBrain.js";
 import { subCat } from "./categories.js";
 
 const K_SIGNALS = "cb_signals_v1";
 const K_BUCKETS = "cb_buckets_v1";
 const K_BTSAMPLE = "cb_btsample_v1";
 const K_BTMETA = "cb_btmeta_v1";
+const K_PATBRAIN = "cb_pattern_model_v1";
 
 const MAX_LIVE = 500;        // tope de senales en vivo guardadas
 const MAX_BTSAMPLE = 1500;   // muestra de backtest para tabla, curva y R medio filtrado
@@ -292,6 +298,25 @@ export function stats() {
     openCount: getSignals().filter((s) => s.outcome === "open").length,
     btMeta: getBtMeta(),
     modelSeen: getModel().seen,
+    patternBrain: patternBrainStats(),
+  };
+}
+
+// Estado del cerebro dedicado de patrones (para su panel en la UI).
+export function patternBrainStats() {
+  const b = getPatternBrain();
+  const t = brainTotals(b);
+  const st = brainState(b, t.wins, t.losses);
+  return {
+    n: st.n, pasos: b.nTrained, ready: st.ready, wins: t.wins, losses: t.losses,
+    winRate: t.wins + t.losses ? t.wins / (t.wins + t.losses) : null,
+    estado: st.label, edge: st.edge, logloss: b.logloss, baseline: st.base,
+    brier: b.brier, dw: b.dwEMA,
+    tp: [b.adaptTP1, b.adaptTP2, b.adaptTP3], sl: b.adaptSL,
+    nMfe: b.mfe.length, nMae: b.maeWin.length,
+    porPatron: Object.entries(b.patternStats ?? {})
+      .map(([name, s]) => ({ name, w: s.w, l: s.l, n: s.w + s.l, wr: s.w + s.l ? s.w / (s.w + s.l) : 0 }))
+      .sort((a, b2) => b2.n - a.n),
   };
 }
 
@@ -326,7 +351,10 @@ export async function backtestSymbol(sym, c15, c1h, c4h, strategies, ind, riskMo
 
     let sigs;
     try {
-      const evalOpts = { tfLabel, ...(btcSeries ? { btcBias: btcBiasAt(btcSeries, decisionTime) } : {}) };
+      const evalOpts = {
+        tfLabel, skip: STRATEGY_KEYS.filter((k) => !list.includes(k)),
+        ...(btcSeries ? { btcBias: btcBiasAt(btcSeries, decisionTime) } : {}),
+      };
       sigs = list.length === 1
         ? [{ strategy: list[0], sig: evaluate(w15, w1, w4, live, list[0], ind, riskMode, evalOpts) }]
         : evaluateAll(w15, w1, w4, live, ind, riskMode, evalOpts).filter((r) => list.includes(r.strategy));
@@ -369,12 +397,21 @@ export async function runBacktest({
   let totalSignals = 0, totalWins = 0, sumR = 0;
   const now = Date.now();
 
-  const stratList = strategies ?? [strategy];
+  const fullList = strategies ?? [strategy];
+  // La estrategia de patrones NO pasa por el bucle generico: su backtest es una cosecha
+  // (detecta TODAS las figuras del historico de una pasada) en vez de re-evaluar ventana
+  // a ventana, que reconstruiria el contexto del detector miles de veces.
+  const patternOn = fullList.includes("patrones");
+  const stratList = fullList.filter((k) => k !== "patrones");
   const multi = stratList.length > 1;
   const DEFAULT_H = { gatillo: "15m", medio: "1h", mayor: "4h", msGatillo: 900000, msMedio: 3600000, msMayor: 14400000 };
   const hzList = tfsList ?? [tfs ?? DEFAULT_H];
   const total = hzList.length * symbols.length;
   let done = 0;
+
+  // Cerebro dedicado de patrones: se siembra con la cosecha y se guarda al final.
+  const patBrain = patternOn ? getPatternBrain() : null;
+  let patTrained = 0;
 
   // La META necesita la historia de BTC 4h (una sola descarga sirve para todos los horizontes).
   let btcSeries = null;
@@ -407,9 +444,34 @@ export async function runBacktest({
       if (!c15?.length || c15.length < 600) { done++; continue; }
 
       onProgress?.({ sym, done, total, fase: "evaluando", tf: H.gatillo });
-      const recs = await backtestSymbol(sym, c15, c1h, c4h, stratList, ind, riskMode, {
-        btcSeries, step, msMedio: H.msMedio, msMayor: H.msMayor, tfLabel: H.gatillo,
-      });
+      const recs = stratList.length
+        ? await backtestSymbol(sym, c15, c1h, c4h, stratList, ind, riskMode, {
+            btcSeries, step, msMedio: H.msMedio, msMayor: H.msMayor, tfLabel: H.gatillo,
+          })
+        : [];
+
+      // ── Cosecha de patrones: una pasada sobre el mismo historico ya descargado.
+      if (patternOn) {
+        onProgress?.({ sym, done, total, fase: "cosechando patrones", tf: H.gatillo });
+        try {
+          const harvest = await harvestShadowTrades(c15, {}, { step: 3, harvestDepth: 3 });
+          trainFromHarvest(patBrain, harvest);
+          patTrained += harvest.samples.length;
+          const sc = subCat(sym);
+          for (const row of harvest.rows) {
+            const win = row.r > 0 ? 1 : 0;
+            addToBuckets(buckets, segmentKeys(
+              { modo: "patrones", dir: row.dir, confidence: "-", tf: H.gatillo }, sc,
+            ), win);
+            sampleRows.push({
+              ts: row.ts, symbol: sym, dir: row.dir, modo: "patrones", tf: H.gatillo,
+              confidence: "-", outcome: row.outcome, r: row.r,
+              detail: `${row.name} · ${row.detail}`, source: "backtest",
+            });
+            totalSignals++; totalWins += win; sumR += row.r;
+          }
+        } catch { /* simbolo sin datos suficientes para el detector */ }
+      }
 
       for (const rec of recs) {
         const win = rec.r > 0 ? 1 : 0;
@@ -432,11 +494,12 @@ export async function runBacktest({
   trainBatch(model, allSamples, 3);
   saveModel(model);
   saveBuckets(buckets);
+  if (patBrain) setPatternBrain(patBrain);
   sampleRows.sort((a, b) => b.ts - a.ts);
   save(K_BTSAMPLE, sampleRows.slice(0, MAX_BTSAMPLE));
   const meta = {
-    ranAt: now, days, riskMode,
-    strategy: multi ? `todas (${stratList.length})` : stratList[0],
+    ranAt: now, days, riskMode, patternSamples: patTrained,
+    strategy: fullList.length > 1 ? `todas (${fullList.length})` : fullList[0],
     tf: hzList.map((h) => h.gatillo).join("+"),
     symbols: symbols.length, signals: totalSignals,
     wins: totalWins, winRate: totalSignals ? totalWins / totalSignals : 0,
@@ -451,7 +514,8 @@ export async function runBacktest({
 export function exportJSON() {
   return JSON.stringify({
     signals: getSignals(), buckets: getBuckets(), model: getModel(),
-    btSample: getBtSample(), btMeta: getBtMeta(), v: 1,
+    patternBrain: getPatternBrain(),
+    btSample: getBtSample(), btMeta: getBtMeta(), v: 2,
   });
 }
 
@@ -460,6 +524,7 @@ export function importJSON(text) {
   if (d.signals) save(K_SIGNALS, d.signals);
   if (d.buckets) save(K_BUCKETS, d.buckets);
   if (d.model) { save("cb_model_v1", d.model); _model = null; }
+  if (d.patternBrain) { save(K_PATBRAIN, d.patternBrain); reloadPatternBrain(); }
   if (d.btSample) save(K_BTSAMPLE, d.btSample);
   if (d.btMeta) save(K_BTMETA, d.btMeta);
 }
@@ -468,4 +533,6 @@ export function clearAll() {
   if (!hasStorage) return;
   [K_SIGNALS, K_BUCKETS, K_BTSAMPLE, K_BTMETA].forEach((k) => localStorage.removeItem(k));
   _model = resetModel();
+  resetBrain();
+  reloadPatternBrain();
 }

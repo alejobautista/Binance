@@ -1,0 +1,1611 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © MarkitTick — Base original
+// v2 Mejorado: fixes de f_isNear/comisión/pivotes, prioridad de patrones, dirección del asta,
+// pendientes normalizadas por ATR, C&H validado, 3 TP por ATR, tracker de win-rate,
+// máquina de estados de trades, filtro de tendencia, filtro de latencia y optimización de rendimiento.
+
+//@version=6
+indicator("Auto Pattern Detector Targets v2 [Mejorado]", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=1000)
+
+// ── INPUTS ──────────────────────────────────────────────────────────────────
+grp_gen  = "General"
+grp_pat  = "Patterns"
+grp_piv  = "Pivot"
+grp_vis  = "Vis"
+grp_flt  = "Filters"
+grp_trn  = "Trend Filter"
+grp_tgt  = "Targets & Risk (3 TP por ATR)"
+grp_trk  = "Trade Tracking / Win-Rate"
+string GRP_DASH = "📊 Dashboard Settings"
+string GRP_ALRT = "Alerts"
+string GRP_UX   = "UI/UX"
+
+cooldown          = input.int(5,      "Pattern Cooldown (Bars)",    minval=1,    group=grp_gen)
+sym_tol           = input.float(10.0, "Symmetry Tolerance (%)",     minval=1.0,  step=0.5,  group=grp_gen) / 100
+lvl_tol           = input.float(3.0,  "Level Tolerance (%)",        minval=0.1,  step=0.1,  group=grp_gen) / 100
+min_size_pct      = input.float(0.5,  "Min Pattern Size (% of Price)", minval=0.1, group=grp_gen) / 100
+min_atr_mult      = input.float(1.0,  "Min Pattern Size (ATR Multiplier)", minval=0.1, step=0.1, group=grp_gen)
+
+show_dt_top       = input.bool(true,  "Double Top",                 group=grp_pat)
+show_dt_bot       = input.bool(true,  "Double Bottom",              group=grp_pat)
+show_tt_top       = input.bool(true,  "Triple Top",                 group=grp_pat)
+show_tt_bot       = input.bool(true,  "Triple Bottom",              group=grp_pat)
+show_hs_std       = input.bool(true,  "Head and Shoulders",         group=grp_pat)
+show_hs_inv       = input.bool(true,  "Inverted Head and Shoulders",group=grp_pat)
+show_flag_bull    = input.bool(true,  "Bullish Flag",               group=grp_pat)
+show_flag_bear    = input.bool(true,  "Bearish Flag",               group=grp_pat)
+show_pennant_bull = input.bool(true,  "Bullish Pennant",            group=grp_pat)
+show_pennant_bear = input.bool(true,  "Bearish Pennant",            group=grp_pat)
+show_wedge_rise   = input.bool(true,  "Rising Wedge",               group=grp_pat)
+show_wedge_fall   = input.bool(true,  "Falling Wedge",              group=grp_pat)
+show_tri_gen      = input.bool(true,  "Triangle",                   group=grp_pat)
+show_rect_gen     = input.bool(true,  "Rectangle",                  group=grp_pat)
+show_cup_std      = input.bool(true,  "Cup and Handle",             group=grp_pat)
+show_cup_inv      = input.bool(true,  "Inverted Cup and Handle",    group=grp_pat)
+
+// FIX #3: un solo par left/right, usado de forma consistente por ta.pivothigh/low nativos
+lb_left          = input.int(10,   "Pivot Lookback Left",    minval=1,   group=grp_piv)
+lb_right         = input.int(10,   "Pivot Lookback Right",   minval=1,   group=grp_piv)
+max_piv_hist     = input.int(500, "Max Pivots to Remember", minval=5, maxval=1000, group=grp_piv)
+
+req_close_brk    = input.bool(false, "Require Candle Close Outside?",    group=grp_flt)
+req_body_brk     = input.bool(false, "Require Full Body Breakout?",      group=grp_flt)
+use_atr_brk      = input.bool(true,  "Use ATR for Threshold?",           group=grp_flt)
+break_atr        = input.float(1.0,  "Breakout Threshold (ATR)",  minval=0.1, step=0.1, group=grp_flt)
+break_pct        = input.float(0.3,  "Breakout Threshold (%)",    minval=0.0, step=0.1, group=grp_flt) / 100
+brk_confirm_bars = input.int(1,      "Confirmation Bars (Consecutive)", minval=1, group=grp_flt)
+// FIX #9: el antiguo "Show Patterns Without Confirmation" apagaba TODO. Ahora separado:
+bypass_confirm   = input.bool(false, "Bypass Breakout Confirmation (solo confirmación)", group=grp_flt, tooltip="Salta cuerpo completo y barras consecutivas. NO desactiva volumen ni R:R")
+min_brk_bar      = input.int(60,     "Scan Lookback Bars",           minval=1,   group=grp_flt, tooltip="Cuántas barras atrás busca rupturas. Era 1 (=ventana de 20 velas): esa es la razón principal de que se detecten poquísimos patrones. 60-120 encuentra mucho más histórico, a costa de más cómputo")
+req_vol          = input.bool(false, "Require Volume Spike?",               group=grp_flt)
+vol_mult         = input.float(1,    "Volume Multiplier",  minval=1.0, step=0.1, group=grp_flt)
+vol_len          = input.int(20,     "Volume SMA Length",                   group=grp_flt)
+req_rr           = input.bool(true,  "Require Min R:R (vs TP2)?",           group=grp_flt)
+min_rr           = input.float(1.0,  "Min Risk:Reward Ratio",  minval=0.1, step=0.1, group=grp_flt)
+slippage_ticks   = input.float(1.0,  "Slippage (Ticks)",       minval=0.0, step=0.1, group=grp_flt)
+// FIX #2: comisión normalizada UNA sola vez, aquí en el input (igual que break_pct)
+commission_pct   = input.float(0.05, "Commission (%)",         minval=0.0, step=0.01, group=grp_flt) / 100
+// MEJORA: filtro de latencia — descarta patrones detectados demasiado tarde
+max_latency      = input.int(8,      "Max Latency (bars desde breakout)", minval=1, maxval=50, group=grp_flt, tooltip="Si la detección llega más de N barras después del breakout, el patrón se descarta: el trade ya no existe")
+
+// MEJORA: filtro de tendencia contextual
+trend_filter_on  = input.bool(false, "Filtrar por tendencia (EMA)",  group=grp_trn)
+trend_len        = input.int(200,    "EMA Length",  minval=10,       group=grp_trn)
+
+// MEJORA PRINCIPAL: 3 TP basados en ATR (medido en la barra del breakout)
+tp1_atr          = input.float(1.5,  "TP1 (× ATR)", minval=0.1, step=0.1, group=grp_tgt)
+tp2_atr          = input.float(3.0,  "TP2 (× ATR)", minval=0.1, step=0.1, group=grp_tgt)
+tp3_atr          = input.float(4.5,  "TP3 (× ATR)", minval=0.1, step=0.1, group=grp_tgt)
+// FIX #8: stop estructural por defecto (anclado al patrón), el % del target queda como opción
+stop_buffer      = input.float(0.5,  "Stop Loss ATR Buffer (estructural)", minval=0.0, step=0.1, group=grp_tgt)
+use_sl_pct_tgt   = input.bool(false, "SL as % of TP2 Dist (alternativo)", group=grp_tgt)
+sl_pct_tgt       = input.float(25.0, "SL % of TP2 Dist",    minval=1.0, maxval=100.0, step=0.5, group=grp_tgt) / 100
+
+// MEJORA: tracker de resultados
+track_en         = input.bool(true, "Track Win-Rate (TP1 antes que SL = win)", group=grp_trk)
+be_after_tp1     = input.bool(true, "Mover SL a breakeven tras TP1",           group=grp_trk)
+time_stop_bars   = input.int(100,   "Time Stop (bars) — expira el trade",      minval=10, group=grp_trk)
+
+// ── MÓDULO DE APRENDIZAJE ───────────────────────────────────────────────────
+string grp_fed = "🌐 Federado Multi-Activo"
+string fed_mode = input.string("Local (entrenar)", "Modo del modelo", options=["Local (entrenar)", "Importado (solo inferir)", "Híbrido (importar + seguir aprendiendo)"], group=grp_fed, tooltip="Local: cada gráfico aprende solo. Importado: usa pesos consolidados de todos tus activos. Híbrido: parte de los consolidados y sigue afinando en este símbolo")
+string w_import    = input.string("", "Pesos W (CSV)",        group=grp_fed, tooltip="Pega la línea 'W' que devuelve el agregador Python")
+string mean_import = input.string("", "Normalizador MEAN (CSV)", group=grp_fed)
+string sd_import   = input.string("", "Normalizador SD (CSV)",   group=grp_fed)
+string tp_import   = input.string("", "TP/SL consolidados (CSV: tp1,tp2,tp3,sl)", group=grp_fed)
+int    n_import    = input.int(0,  "Muestras del modelo importado", minval=0, group=grp_fed)
+bool   fed_export  = input.bool(true, "Emitir alerta de exportación del modelo", group=grp_fed, tooltip="Dispara una alerta con el estado del modelo en JSON para tu webhook/agregador")
+
+string grp_geo = "📐 Validación Geométrica"
+max_pat_width = input.int(120, "Ancho máximo del patrón (barras)", minval=10, group=grp_geo, tooltip="Evita 'triángulos' que cruzan medio gráfico. Patrones más anchos se descartan")
+min_pat_width = input.int(8,   "Ancho mínimo del patrón (barras)", minval=3,  group=grp_geo)
+containment_en= input.bool(true,"Exigir contención del precio", group=grp_geo, tooltip="El precio debe estar realmente DENTRO de las dos líneas. Sin esto se dibujan rectas al azar")
+contain_tol   = input.float(15.0,"Tolerancia de fuga (%)", minval=0.0, maxval=50.0, step=1.0, group=grp_geo) / 100
+
+string grp_shadow = "🎓 Entrenamiento (shadow trades)"
+shadow_en   = input.bool(true, "Entrenar con TODOS los setups detectados", group=grp_shadow, tooltip="Registra también los patrones que no se dibujan. Multiplica las muestras del modelo sin ensuciar el gráfico")
+shadow_max  = input.int(120, "Máx. trades simultáneos en seguimiento", minval=5, maxval=400, group=grp_shadow)
+harvest_lat = input.int(200, "Latencia máx. para APRENDER (barras)", minval=10, maxval=500, group=grp_shadow, tooltip="Clave: para OPERAR la latencia debe ser baja (8), pero para APRENDER un setup viejo sigue siendo un dato perfectamente válido. Separar ambos umbrales es lo que llena el modelo de muestras")
+harvest_depth = input.int(3, "Profundidad de rotación de pivotes", minval=0, maxval=8, group=grp_shadow, tooltip="0 = solo los pivotes más recientes (comportamiento anterior). 3 = también evalúa combinaciones de pivotes más antiguos. Cada nivel multiplica las detecciones y el cómputo")
+
+string grp_smc = "🧬 Contexto Smart Money"
+smc_en      = input.bool(true, "Usar features SMC (barrido + estructura)", group=grp_smc)
+smc_look    = input.int(20, "Ventana de liquidez (barras)", minval=5, group=grp_smc)
+
+string grp_ui = "🎨 Diseño"
+ui_compact  = input.bool(false, "Dashboard compacto", group=grp_ui, tooltip="6 filas esenciales en vez de 18")
+ui_pos      = input.string("Arriba derecha", "Posición del panel", options=["Arriba derecha","Arriba izquierda","Abajo derecha","Abajo izquierda"], group=grp_ui)
+ui_label    = input.string("Completo", "Etiqueta del setup", options=["Completo","Mínimo","Oculto"], group=grp_ui)
+
+string grp_bm = "🌐 Régimen de Mercado (benchmark)"
+bool   bm_en   = input.bool(true, "Usar features de benchmark", group=grp_bm, tooltip="Régimen compartido entre activos: es lo que hace comparable el aprendizaje de un símbolo a otro")
+string bm_sym  = input.symbol("BINANCE:BTCUSDT", "Símbolo benchmark", group=grp_bm)
+
+string grp_ml = "🧠 Brain — Aprendizaje Online"
+ml_en          = input.bool(true,  "Activar cerebro (regresión logística online)", group=grp_ml)
+ml_gate_en     = input.bool(false, "Filtrar setups con p(win) baja",  group=grp_ml, tooltip="Actívalo SOLO tras acumular >40 trades resueltos. Antes, el modelo no sabe nada")
+ml_min_p       = input.float(0.45, "Umbral mínimo p(win)", minval=0.0, maxval=1.0, step=0.01, group=grp_ml)
+ml_warm        = input.int(40,     "Trades mínimos antes de filtrar", minval=10, group=grp_ml)
+ml_lr          = input.float(0.03, "Learning rate", minval=0.001, maxval=0.5, step=0.001, group=grp_ml)
+ml_l2          = input.float(0.002,"Regularización L2", minval=0.0, maxval=0.1, step=0.001, group=grp_ml, tooltip="Penaliza pesos grandes: la principal defensa contra sobreajuste")
+ml_balance     = input.bool(true,  "Compensar desbalance win/loss", group=grp_ml, tooltip="Expirar sin llegar a TP1 cuenta como pérdida, así que las derrotas suelen ser mayoría. Sin compensar, el modelo aprende el atajo de decir 'pierde' siempre: acierta mucho y no informa nada. Esto sube el peso de la clase minoritaria (tope 4x)")
+
+string grp_ad = "🎯 TP/SL Adaptativos (MFE/MAE)"
+adapt_en       = input.bool(true, "TP adaptativos por cuantiles de MFE",  group=grp_ad)
+adapt_min_n    = input.int(20,    "Muestras mínimas para adaptar", minval=10, group=grp_ad)
+adapt_q1       = input.float(50,  "TP1 = percentil N de MFE", minval=10, maxval=95, step=5, group=grp_ad)
+adapt_q2       = input.float(75,  "TP2 = percentil N de MFE", minval=10, maxval=95, step=5, group=grp_ad)
+adapt_q3       = input.float(90,  "TP3 = percentil N de MFE", minval=10, maxval=99, step=5, group=grp_ad)
+adapt_sl_en    = input.bool(true, "SL adaptativo por MAE de ganadores", group=grp_ad)
+adapt_sl_q     = input.float(80,  "SL = percentil N de MAE (ganadores)", minval=50, maxval=99, step=5, group=grp_ad)
+adapt_max_atr  = input.float(10.0,"Clamp máximo (× ATR)", minval=1.0, step=0.5, group=grp_ad)
+
+col_bull         = input.color(color.rgb(0, 255, 180, 0),    "Bullish Color",       group=grp_vis)
+col_bear         = input.color(color.rgb(255, 30, 120, 0),   "Bearish Color",       group=grp_vis)
+col_neu          = input.color(color.rgb(160, 80, 255, 0),   "Neutral/Text Color",  group=grp_vis)
+col_pend         = input.color(color.rgb(0, 200, 255, 0),    "High-Latency Pattern Color", group=grp_vis)
+fill_transp      = input.int(80, "Fill Transparency", minval=50, maxval=99, group=grp_vis)
+show_tgt         = input.bool(true,  "Show Targets (TP1/TP2/TP3)",     group=grp_vis)
+max_patterns     = input.int(3,      "Max Patterns Displayed", minval=1, maxval=50, group=grp_vis)
+extend_lines     = input.bool(false, "Extend Breakout Lines",      group=grp_vis)
+col_entry        = input.color(color.rgb(255, 220, 0, 0),    "Entry Line Color",  group=grp_vis)
+col_stop         = input.color(color.rgb(255, 50, 130, 0),   "Stop Line Color",   group=grp_vis)
+col_target       = input.color(color.rgb(0, 255, 160, 0),    "Target Line Color", group=grp_vis)
+
+color  dash_bg_color  = input.color(color.rgb(10, 10, 18, 5),    "Background Color", group=GRP_DASH)
+color  dash_txt_color = input.color(color.rgb(220, 220, 235, 0), "Text Color",       group=GRP_DASH)
+bool   alert_en      = input.bool(true, "Enable Alerts (JSON webhook)", group=GRP_ALRT)
+bool   atr_norm_en   = input.bool(false, "Normalized ATR Display",  group=GRP_UX)
+bool   lbl_scale_en  = input.bool(false, "Custom Label Scaling",    group=GRP_UX)
+string lbl_scale_sel = input.string("Normal", "Label Size", options=["Small", "Normal", "Large"], group=GRP_UX)
+
+// ── USER-DEFINED TYPES ───────────────────────────────────────────────────────
+type Pivot
+    float p
+    int   i
+
+type PatternResult
+    bool   detected    = false
+    string name        = ""
+    bool   isBullish   = false
+    float  entryPrice  = na
+    float  stopPrice   = na
+    float  tp1         = na
+    float  tp2         = na
+    float  tp3         = na
+    int    start_idx   = na
+    int    breakout_idx= na
+    int    fux1 = na
+    float  fuy1 = na
+    int    fux2 = na
+    float  fuy2 = na
+    int    flx1 = na
+    float  fly1 = na
+    int    flx2 = na
+    float  fly2 = na
+    int    lux1 = na
+    float  luy1 = na
+    int    lux2 = na
+    float  luy2 = na
+    int    llx1 = na
+    float  lly1 = na
+    int    llx2 = na
+    float  lly2 = na
+
+type PatternDrawings
+    line[]  lns
+    label[] lbls
+
+// MEJORA: máquina de estados por trade
+// state: 0=activo, 1=TP1 tocado, 2=TP2 tocado  (TP3/SL/expiración cierran y remueven)
+type ActiveTrade
+    string name
+    bool   isBull
+    float  entry
+    float  sl
+    float  tp1
+    float  tp2
+    float  tp3
+    int    birth
+    int    state = 0
+    // — extensiones del cerebro —
+    array<float> feats = na    // vector congelado en la entrada (sin fuga de información)
+    float  atr0  = na          // ATR en la barra del breakout: normaliza MFE/MAE
+    float  mfe   = 0.0         // Maximum Favorable Excursion, en unidades de ATR
+    float  mae   = 0.0         // Maximum Adverse Excursion, en unidades de ATR
+    float  pwin  = na          // p(win) que el modelo asignó al abrirlo
+
+// ── PERSISTENT STATE ─────────────────────────────────────────────────────────
+var array<Pivot> pivotHighs = array.new<Pivot>()
+var array<Pivot> pivotLows  = array.new<Pivot>()
+var array<PatternDrawings> pat_history = array.new<PatternDrawings>()
+var array<ActiveTrade> open_trades = array.new<ActiveTrade>()
+
+// MEJORA: estadísticas por nombre de patrón (v6 maps) + agregadas
+var map<string, int> stat_wins_map = map.new<string, int>()
+var map<string, int> stat_loss_map = map.new<string, int>()
+var int stat_wins    = 0
+var int stat_losses  = 0
+var int stat_tp2hits = 0
+var int stat_tp3hits = 0
+var int stat_expired = 0
+
+// ── ESTADO DEL CEREBRO ───────────────────────────────────────────────────────
+// N_FEAT incluye el bias en la posición 0.
+// 0-10: contexto propio del símbolo. 11-12: régimen del benchmark (compartido
+// entre todos los activos) — son estas dos las que dan sentido a promediar
+// modelos entrenados en símbolos distintos.
+const int N_FEAT = 15
+var array<float> W      = array.new<float>(N_FEAT, 0.0)   // pesos (la "red": 11 entradas → 1 neurona sigmoide)
+var array<float> F_MEAN = array.new<float>(N_FEAT, 0.0)   // media corriente (Welford) para estandarizar
+var array<float> F_M2   = array.new<float>(N_FEAT, 0.0)   // suma de cuadrados de desvíos
+// Contadores como arrays de 1 elemento: Pine prohíbe reasignar globales escalares
+// dentro de una función, pero sí permite mutar objetos (arrays/maps).
+var array<float> CNT = array.new<float>(5, 0.0)
+// CNT[0] = observaciones del normalizador
+// CNT[1] = trades usados para entrenar
+// CNT[2] = log-loss suavizada — la métrica de si aprende o no
+// CNT[3] = Brier score suavizado (calibración)
+// CNT[4] = norma del cambio de pesos (EMA) → medidor de convergencia
+
+// Memorias empíricas para TP/SL adaptativos (en unidades de ATR)
+var array<float> MFE_MEM     = array.new<float>()  // excursión favorable de trades resueltos
+var array<float> MAE_WIN_MEM = array.new<float>()  // excursión adversa SOLO de ganadores
+var float ADAPT_TP1 = na
+var float ADAPT_TP2 = na
+var float ADAPT_TP3 = na
+var float ADAPT_SL  = na
+
+var float SLIP_COST_ABS = slippage_ticks * syminfo.mintick
+var string dash_pat_name  = "—"
+var bool   dash_pat_bull  = false
+var int    dash_last_bar  = 0
+var float  dash_entry     = na
+var float  dash_stop      = na
+var float  dash_tp2       = na
+var int    dash_latency   = na
+
+string clean_ticker = syminfo.prefix + ':' + syminfo.ticker
+
+// ── GLOBAL CALCULATIONS ──────────────────────────────────────────────────────
+vol_sma   = ta.sma(volume, math.max(1, math.min(vol_len, bar_index + 1)))
+atr_val   = ta.atr(14)
+ema_trend = ta.ema(close, trend_len)
+
+// Contexto para el cerebro
+rsi_val   = ta.rsi(close, 14)
+atr_base  = ta.sma(atr_val, 100)
+// Efficiency Ratio de Kaufman: 1 = tendencia limpia, 0 = puro ruido lateral
+_er_chg   = math.abs(close - nz(close[20], close))
+_er_vol   = math.sum(math.abs(close - nz(close[1], close)), 20)
+kama_er   = _er_vol > 0 ? _er_chg / _er_vol : 0.0
+
+// ── RÉGIMEN DEL BENCHMARK (compartido entre activos) ─────────────────────────
+// Solo escalares simples: request.security con lookahead_off y expresiones
+// cerradas, para evitar repintado.
+f_bm_state() =>
+    float _a  = ta.atr(14)
+    float _e  = ta.ema(close, 50)
+    float _al = (close - _e) / math.max(_a, syminfo.mintick)      // tendencia en unidades ATR
+    float _ab = ta.sma(_a, 100)
+    float _vr = _ab > 0 ? _a / _ab : 1.0                          // régimen de volatilidad
+    [_al, _vr]
+
+// request.security se llama SIEMPRE (Pine no admite llamadas condicionales ni
+// ternarios que devuelvan tuplas). El interruptor se aplica al resultado.
+[bm_align_raw, bm_vol_raw] = request.security(bm_sym, timeframe.period, f_bm_state(), lookahead=barmerge.lookahead_off)
+bm_align = bm_en ? nz(bm_align_raw, 0.0) : 0.0
+bm_vol   = bm_en ? nz(bm_vol_raw,   1.0) : 1.0
+
+// ── CONTEXTO SMART MONEY ─────────────────────────────────────────────────────
+// Barrido de liquidez: la vela perfora el mínimo/máximo de las N previas y
+// CIERRA de vuelta dentro del rango. Es la firma de absorción institucional.
+_prior_low  = ta.lowest(low,  smc_look)[1]
+_prior_high = ta.highest(high, smc_look)[1]
+sweep_low   = low  < _prior_low  and close > _prior_low      // barrido bajo → sesgo alcista
+sweep_high  = high > _prior_high and close < _prior_high     // barrido alto → sesgo bajista
+// Sesgo de estructura simple: posición del cierre dentro del rango reciente
+_rng_hi     = ta.highest(high, smc_look * 2)
+_rng_lo     = ta.lowest(low,   smc_look * 2)
+smc_pos     = _rng_hi > _rng_lo ? (close - _rng_lo) / (_rng_hi - _rng_lo) : 0.5   // 0=discount, 1=premium
+// ¿Hubo barrido reciente en cualquiera de las dos direcciones? (+1 alcista / −1 bajista / 0 no)
+sweep_bias  = ta.barssince(sweep_low)  <= smc_look ? 1.0 : ta.barssince(sweep_high) <= smc_look ? -1.0 : 0.0
+
+// ── HELPER FUNCTIONS ─────────────────────────────────────────────────────────
+f_project(float x1, float y1, float x2, float y2, float target_x) =>
+    x2 == x1 ? y1 : y1 + ((y2 - y1) / (x2 - x1)) * (target_x - x1)
+
+// FIX #1: abs() en el promedio — funciona con valores negativos (pendientes de flags alcistas)
+f_isNear(float v1, float v2, float tol_pct) =>
+    math.abs(v1 - v2) <= math.abs((v1 + v2) / 2) * tol_pct
+
+f_neck_at_break(int nl_i, float nl_p, int nr_i, float nr_p, int b_idx) =>
+    na(nl_i) and na(nr_i) ? na :
+     na(nl_i) ? nr_p :
+     na(nr_i) ? nl_p :
+     nl_i == nr_i ? nl_p : f_project(nl_i, nl_p, nr_i, nr_p, b_idx)
+
+// Ancho del patrón dentro de límites razonables
+f_valid_width(int i0, int i1) =>
+    int w = math.abs(nz(i1) - nz(i0))
+    w >= min_pat_width and w <= max_pat_width
+
+// Contención: ¿el precio estuvo realmente DENTRO de las dos rectas?
+// Sin esta prueba se dibujan dos rectas arbitrarias y se llaman "triángulo".
+f_contained(int ux1, float uy1, int ux2, float uy2, int lx1, float ly1, int lx2, float ly2) =>
+    bool ok = true
+    if containment_en
+        int i0 = math.max(math.min(ux1, lx1), 0)
+        int i1 = math.max(ux2, lx2)
+        int w  = i1 - i0
+        if w < min_pat_width
+            ok := false
+        else
+            int breaches = 0
+            int checked  = 0
+            for k = 0 to w
+                int bi = i0 + k
+                int off = bar_index - bi
+                if off < 0 or off > 4999
+                    continue
+                float pu = f_project(ux1, uy1, ux2, uy2, bi)
+                float pl = f_project(lx1, ly1, lx2, ly2, bi)
+                if na(pu) or na(pl) or pu <= pl
+                    continue
+                float tol = (pu - pl) * contain_tol
+                checked += 1
+                if high[off] > pu + tol or low[off] < pl - tol
+                    breaches += 1
+            // Se admite hasta un 20% de velas fuera; más que eso no es un patrón
+            ok := checked >= min_pat_width and breaches <= checked * 0.20
+    ok
+
+f_isValidSize(float height, float price) =>
+    height > math.max(price * min_size_pct, atr_val * min_atr_mult)
+
+f_apply_buffer(float price, bool isBullish) =>
+    isBullish ? price - (atr_val * stop_buffer) : price + (atr_val * stop_buffer)
+
+// MEJORA: 3 TP por ATR medido en la barra del breakout (no la barra de detección)
+f_tps(float entry_p, bool isBull, int b_idx) =>
+    int   offs = math.max(0, bar_index - nz(b_idx, bar_index))
+    float a    = nz(atr_val[offs], atr_val)
+    // Multiplicadores efectivos: fijos al inicio, empíricos cuando hay evidencia.
+    // El blend w = n/(n+adapt_min_n) es un encogimiento bayesiano: la confianza
+    // en los datos crece de forma continua, sin un salto brusco al llegar al umbral.
+    float m1 = tp1_atr
+    float m2 = tp2_atr
+    float m3 = tp3_atr
+    if adapt_en and not na(ADAPT_TP1) and MFE_MEM.size() >= adapt_min_n
+        float w = MFE_MEM.size() / (MFE_MEM.size() + float(adapt_min_n))
+        m1 := tp1_atr * (1 - w) + ADAPT_TP1 * w
+        m2 := tp2_atr * (1 - w) + ADAPT_TP2 * w
+        m3 := tp3_atr * (1 - w) + ADAPT_TP3 * w
+        // Los TP deben quedar siempre ordenados y separados
+        m2 := math.max(m2, m1 * 1.2)
+        m3 := math.max(m3, m2 * 1.2)
+    float t1 = isBull ? entry_p + a * m1 : entry_p - a * m1
+    float t2 = isBull ? entry_p + a * m2 : entry_p - a * m2
+    float t3 = isBull ? entry_p + a * m3 : entry_p - a * m3
+    [t1, t2, t3]
+
+f_sl_pat(float anchor, bool isBull, float entry_p, float tp2_ref) =>
+    // SL aprendido: percentil alto del MAE de los trades GANADORES.
+    // Traducción: "¿cuánto suele ir en contra un trade que después funciona?"
+    // Colocar el stop debajo de ese valor evita que te saquen de operaciones buenas.
+    if adapt_sl_en and not na(ADAPT_SL) and MAE_WIN_MEM.size() >= adapt_min_n and not na(entry_p)
+        isBull ? entry_p - atr_val * ADAPT_SL : entry_p + atr_val * ADAPT_SL
+    else if use_sl_pct_tgt and not na(entry_p) and not na(tp2_ref)
+        float _dist = math.abs(tp2_ref - entry_p)
+        isBull ? entry_p - _dist * sl_pct_tgt : entry_p + _dist * sl_pct_tgt
+    else
+        f_apply_buffer(anchor, isBull)
+
+f_get_entry_price(int b_idx) =>
+    int offs = bar_index - b_idx
+    offs >= 1 ? open[offs] : na
+
+f_get_break_idx_precise(float x1, float y1, float x2, float y2, bool isUp) =>
+    int   b_idx      = na
+    int   scan_limit = math.max(min_brk_bar, lb_right) + 10
+    float m          = x2 == x1 ? 0.0 : (y2 - y1) / (x2 - x1)
+    for i = scan_limit to 1
+        if (bar_index - i) < 0
+            continue
+        float proj_price  = x2 == x1 ? y1 : y1 + m * ((bar_index - i) - x1)
+        float margin      = use_atr_brk ? atr_val[i] * break_atr : proj_price * break_pct
+        float up_thresh   = proj_price + margin
+        float down_thresh = proj_price - margin
+        float check_val   = req_close_brk ? close[i] : isUp ? high[i] : low[i]
+        bool  is_broken   = isUp ? check_val > up_thresh : check_val < down_thresh
+        if req_body_brk and is_broken and not bypass_confirm
+            is_broken := isUp ? open[i] > up_thresh and close[i] > up_thresh : open[i] < down_thresh and close[i] < down_thresh
+        if is_broken
+            bool confirmed = true
+            if brk_confirm_bars > 1 and not bypass_confirm
+                for k = 1 to brk_confirm_bars - 1
+                    int check_idx = i - k
+                    if check_idx < 0
+                        confirmed := false
+                        break
+                    float proj_k   = x2 == x1 ? y1 : y1 + m * ((bar_index - check_idx) - x1)
+                    float margin_k = use_atr_brk ? atr_val[check_idx] * break_atr : proj_k * break_pct
+                    if isUp and close[check_idx] <= proj_k + margin_k
+                        confirmed := false
+                        break
+                    else if not isUp and close[check_idx] >= proj_k - margin_k
+                        confirmed := false
+                        break
+            if confirmed
+                b_idx := bar_index - i
+                break
+    b_idx
+
+// FIX #9: volumen y R:R con sus propios interruptores; bypass_confirm ya NO los apaga
+f_validate_pattern(int b_idx, float entry_p, float stop_p, float tp2_p) =>
+    bool valid = true
+    if req_vol and not na(b_idx)
+        int offs = bar_index - b_idx
+        if offs >= 0 and offs < bar_index
+            float sma_at_offs = vol_sma[offs]
+            if not na(sma_at_offs) and volume[offs] <= sma_at_offs * vol_mult
+                valid := false
+    if valid and req_rr and not na(entry_p)
+        // FIX #2: comisión ya normalizada en el input — una sola división
+        float total_cost = SLIP_COST_ABS + entry_p * commission_pct * 2
+        float risk       = math.abs(entry_p - stop_p)
+        float reward_adj = math.max(0, math.abs(tp2_p - entry_p) - total_cost)
+        if risk == 0 or reward_adj / risk < min_rr
+            valid := false
+    valid
+
+f_fill_sliced(int ux1, float uy1, int ux2, float uy2, int lx1, float ly1, int lx2, float ly2, color fill_col, array<line> lns_arr) =>
+    line ln_top = line.new(ux1, uy1, ux2, uy2, color=color.new(fill_col, 100), width=1)
+    line ln_bot = line.new(lx1, ly1, lx2, ly2, color=color.new(fill_col, 100), width=1)
+    linefill.new(ln_top, ln_bot, color.new(fill_col, fill_transp))
+    array.push(lns_arr, ln_top)
+    array.push(lns_arr, ln_bot)
+
+f_manage_drawings(int max_items) =>
+    while array.size(pat_history) > max_items
+        PatternDrawings old_pat = array.shift(pat_history)
+        for _ln in old_pat.lns
+            if not na(_ln)
+                line.delete(_ln)
+        for _lb in old_pat.lbls
+            if not na(_lb)
+                label.delete(_lb)
+
+f_stat_add(map<string, int> m, string k) =>
+    m.put(k, nz(m.get(k)) + 1)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CEREBRO — regresión logística online (perceptrón sigmoide de 1 capa)
+//
+//  Por qué UNA capa y no una red profunda: aquí las muestras son trades resueltos,
+//  y llegan de a decenas, no de a millones. Con esa escala una red con capas ocultas
+//  memoriza el ruido del mercado y su p(win) deja de significar nada fuera de la
+//  muestra. Una logística con L2 y features estandarizadas da probabilidades
+//  CALIBRADAS —que es lo que se necesita para filtrar setups— y además cada peso
+//  es legible: se puede auditar qué sube y qué baja la probabilidad. El poder
+//  expresivo se gana en las FEATURES (régimen, SMC, prior por patrón), no en capas.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Sigmoide con clamp: evita overflow y gradientes muertos
+f_sigmoid(float z) =>
+    float zc = math.max(-30.0, math.min(30.0, z))
+    1.0 / (1.0 + math.exp(-zc))
+
+// Prior Beta con encogimiento: con pocos trades tiende a la tasa base (0.5),
+// con muchos tiende al win-rate real del patrón. Evita el "2 trades = 100%".
+f_beta_prior(string pat) =>
+    float w = nz(stat_wins_map.get(pat))
+    float l = nz(stat_loss_map.get(pat))
+    (w + 2.0) / (w + l + 4.0)      // Beta(2,2) como prior
+
+// Actualiza media/varianza corrientes (Welford) — el normalizador aprende la escala
+f_norm_update(array<float> x) =>
+    CNT.set(0, CNT.get(0) + 1.0)
+    float n = CNT.get(0)
+    for i = 1 to N_FEAT - 1          // el bias (índice 0) no se estandariza
+        float v  = x.get(i)
+        float mu = F_MEAN.get(i)
+        float d  = v - mu
+        F_MEAN.set(i, mu + d / n)
+        F_M2.set(i, F_M2.get(i) + d * (v - F_MEAN.get(i)))
+
+// Devuelve el vector estandarizado (z-score) con clamp a ±4 sigma contra outliers
+f_standardize(array<float> x) =>
+    array<float> z = array.new<float>(N_FEAT, 0.0)
+    z.set(0, 1.0)
+    float n = CNT.get(0)
+    for i = 1 to N_FEAT - 1
+        float sd = n > 1 ? math.sqrt(F_M2.get(i) / (n - 1)) : 0.0
+        float v  = sd > 1e-10 ? (x.get(i) - F_MEAN.get(i)) / sd : 0.0
+        z.set(i, math.max(-4.0, math.min(4.0, v)))
+    z
+
+// Forward pass: z = W·x  →  p = sigmoid(z)
+f_predict(array<float> x) =>
+    array<float> zx = f_standardize(x)
+    float acc = 0.0
+    for i = 0 to N_FEAT - 1
+        acc += W.get(i) * zx.get(i)
+    f_sigmoid(acc)
+
+// Backward pass. Gradiente de la log-loss para la sigmoide: ∂L/∂w = (p − y)·x
+// Se llama SOLO al resolverse el trade, con las features congeladas en la entrada.
+f_train(array<float> x, float y) =>
+    f_norm_update(x)
+    array<float> zx = f_standardize(x)
+    float acc = 0.0
+    for i = 0 to N_FEAT - 1
+        acc += W.get(i) * zx.get(i)
+    float p   = f_sigmoid(acc)
+    // Peso de clase: las derrotas suelen ser mayoría (expirar sin TP1 también cuenta como
+    // pérdida). Sin compensar, el modelo aprende el atajo de predecir siempre "pierde":
+    // baja la log-loss sin aportar nada útil. Se sube la clase minoritaria, con tope 4x
+    // para que unas pocas muestras raras no desboquen el gradiente.
+    float cw  = 1.0
+    if ml_balance
+        float nw = math.max(0.0, stat_wins)
+        float nl = math.max(0.0, stat_losses)
+        cw := y > 0.5 ? (nw > 0 ? math.min(4.0, nl / nw) : 1.0) : (nl > 0 ? math.min(4.0, nw / nl) : 1.0)
+        cw := math.max(1.0, cw)
+    float err = (y - p) * cw
+    float dnorm = 0.0
+    for i = 0 to N_FEAT - 1
+        float g  = err * zx.get(i) - (i == 0 ? 0.0 : ml_l2 * W.get(i))  // L2 no aplica al bias
+        float dw = ml_lr * g
+        W.set(i, W.get(i) + dw)
+        dnorm += dw * dw
+    // Convergencia: cuánto se movieron los pesos en esta actualización.
+    // Cuando esto se acerca a cero, el modelo dejó de aprender cosas nuevas.
+    CNT.set(4, CNT.get(4) * 0.9 + math.sqrt(dnorm) * 0.1)
+    CNT.set(1, CNT.get(1) + 1.0)
+    float pc  = math.max(1e-6, math.min(1.0 - 1e-6, p))
+    float ll  = -(y * math.log(pc) + (1.0 - y) * math.log(1.0 - pc))
+    float br  = math.pow(y - p, 2)
+    float a   = 0.05                                   // EMA de las métricas
+    bool  fst = CNT.get(1) <= 1.0
+    CNT.set(2, fst ? ll : CNT.get(2) * (1 - a) + ll * a)
+    CNT.set(3, fst ? br : CNT.get(3) * (1 - a) + br * a)
+
+// Cuantil empírico sobre una copia ordenada (interpolación lineal)
+f_quantile(array<float> arr, float q) =>
+    int n = arr.size()
+    float out = na
+    if n > 0
+        array<float> s = arr.copy()
+        s.sort()
+        float pos = (n - 1) * math.max(0.0, math.min(1.0, q / 100.0))
+        int   lo  = int(math.floor(pos))
+        int   hi  = int(math.ceil(pos))
+        out := lo == hi ? s.get(lo) : s.get(lo) + (s.get(hi) - s.get(lo)) * (pos - lo)
+    out
+
+// Memoria acotada: conserva las últimas N observaciones (el mercado cambia)
+f_push_capped(array<float> arr, float v, int cap) =>
+    arr.push(v)
+    while arr.size() > cap
+        arr.shift()
+
+// Construye el vector de features de un setup. TODO se lee en la barra del
+// breakout (offset _fo) — nunca con información posterior.
+f_build_feats(PatternResult r, int lat) =>
+    array<float> x = array.new<float>(N_FEAT, 0.0)
+    int   _fo   = math.max(0, bar_index - nz(r.breakout_idx))
+    float _a0   = math.max(nz(atr_val[_fo], atr_val), syminfo.mintick)
+    float _dir  = r.isBullish ? 1.0 : -1.0
+    float _volr = nz(vol_sma[_fo]) > 0 ? volume[_fo] / vol_sma[_fo] : 1.0
+    float _hgt  = math.abs(nz(r.tp2) - nz(r.entryPrice))
+    float _risk = math.max(math.abs(nz(r.entryPrice) - nz(r.stopPrice)), syminfo.mintick)
+    int   _dur  = math.max(1, nz(r.breakout_idx) - nz(r.start_idx))
+    x.set(0,  1.0)
+    x.set(1,  lat / float(max_latency))
+    x.set(2,  math.log(math.max(0.05, _volr)))
+    x.set(3,  _dir * (close[_fo] - nz(ema_trend[_fo], close[_fo])) / _a0)
+    x.set(4,  math.log(1.0 + _hgt / _a0))
+    x.set(5,  math.min(10.0, _hgt / _risk))
+    x.set(6,  math.min(4.0, _dur / 50.0))
+    x.set(7,  _dir * (nz(rsi_val[_fo], 50.0) - 50.0) / 50.0)
+    x.set(8,  nz(kama_er[_fo], 0.0))
+    x.set(9,  nz(atr_base[_fo]) > 0 ? _a0 / atr_base[_fo] : 1.0)
+    x.set(10, f_beta_prior(r.name))
+    x.set(11, _dir * math.max(-6.0, math.min(6.0, nz(bm_align[_fo], 0.0))))
+    x.set(12, math.max(0.2, math.min(4.0, nz(bm_vol[_fo], 1.0))))
+    x.set(13, smc_en ? _dir * nz(sweep_bias[_fo], 0.0) : 0.0)
+    x.set(14, smc_en ? (r.isBullish ? 1.0 - nz(smc_pos[_fo], 0.5) : nz(smc_pos[_fo], 0.5)) : 0.5)
+    x
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  FEDERADO — serialización del modelo para agregar entre símbolos
+// ═══════════════════════════════════════════════════════════════════════════
+
+f_arr_to_csv(array<float> a) =>
+    string s = ""
+    for i = 0 to a.size() - 1
+        s += (i > 0 ? "," : "") + str.tostring(a.get(i), "#.######")
+    s
+
+// Parsea CSV a array. Si el texto está vacío o no cuadra el tamaño, devuelve na
+// (fail-safe: mejor caer al modelo local que cargar un vector corrupto).
+f_csv_to_arr(string src, int n) =>
+    array<float> out = na
+    if str.length(str.trim(src)) > 0
+        array<string> parts = str.split(str.replace_all(src, " ", ""), ",")
+        if parts.size() == n
+            array<float> tmp = array.new<float>(n, 0.0)
+            bool ok = true
+            for i = 0 to n - 1
+                float v = str.tonumber(parts.get(i))
+                if na(v)
+                    ok := false
+                    break
+                tmp.set(i, v)
+            if ok
+                out := tmp
+    out
+
+f_blockBar(float score) =>
+    int    n = math.min(math.max(math.round(score), 0), 10)
+    string s = ''
+    for i = 1 to 10
+        s += i <= n ? '█' : '░'
+    s + ' ' + str.tostring(math.round(score / 10.0 * 100.0), '##0') + '%'
+
+f_blockColor(float score) =>
+    score >= 7.0 ? color.rgb(0, 255, 120) : score >= 4.0 ? color.rgb(80, 255, 0) : score >= 1.5 ? color.rgb(200, 200, 0) : color.rgb(110, 110, 110)
+
+// ── PATTERN DETECTION FUNCTIONS ──────────────────────────────────────────────
+detectHS() =>
+    res = PatternResult.new()
+    _has_hs  = pivotHighs.size() >= 3 and pivotLows.size() >= 2
+    _has_ihs = pivotLows.size() >= 3 and pivotHighs.size() >= 2
+    _rs       = _has_hs  ? pivotHighs.get(0) : Pivot.new(na, na)
+    _head     = _has_hs  ? pivotHighs.get(1) : Pivot.new(na, na)
+    _ls       = _has_hs  ? pivotHighs.get(2) : Pivot.new(na, na)
+    _l_neck_r = _has_hs  ? pivotLows.get(0)  : Pivot.new(na, na)
+    _l_neck_l = _has_hs  ? pivotLows.get(1)  : Pivot.new(na, na)
+    _rs_inv   = _has_ihs ? pivotLows.get(0)   : Pivot.new(na, na)
+    _head_inv = _has_ihs ? pivotLows.get(1)   : Pivot.new(na, na)
+    _ls_inv   = _has_ihs ? pivotLows.get(2)   : Pivot.new(na, na)
+    _h_neck_r = _has_ihs ? pivotHighs.get(0)  : Pivot.new(na, na)
+    _h_neck_l = _has_ihs ? pivotHighs.get(1)  : Pivot.new(na, na)
+    int   _b_hs      = f_get_break_idx_precise(_l_neck_l.i, _l_neck_l.p, _l_neck_r.i, _l_neck_r.p, false)
+    int   _b_ihs     = f_get_break_idx_precise(_h_neck_l.i, _h_neck_l.p, _h_neck_r.i, _h_neck_r.p, true)
+    float _ep_hs     = f_get_entry_price(_b_hs)
+    float _na_hs     = f_neck_at_break(_l_neck_l.i, _l_neck_l.p, _l_neck_r.i, _l_neck_r.p, nz(_b_hs))
+    float _neck_avg  = (nz(_l_neck_r.p) + nz(_l_neck_l.p)) / 2
+    float _ht_hs     = nz(_head.p) - _neck_avg
+    [_t1_hs, _t2_hs, _t3_hs] = f_tps(_ep_hs, false, _b_hs)
+    float _sp_hs     = f_sl_pat(_rs.p, false, _ep_hs, _t2_hs)
+    bool  _val_hs    = f_validate_pattern(_b_hs, _ep_hs, _sp_hs, _t2_hs)
+    float _ep_ihs    = f_get_entry_price(_b_ihs)
+    float _na_ihs    = f_neck_at_break(_h_neck_l.i, _h_neck_l.p, _h_neck_r.i, _h_neck_r.p, nz(_b_ihs))
+    float _neck_avg_inv = (nz(_h_neck_r.p) + nz(_h_neck_l.p)) / 2
+    float _ht_ihs    = _neck_avg_inv - nz(_head_inv.p)
+    [_t1_ihs, _t2_ihs, _t3_ihs] = f_tps(_ep_ihs, true, _b_ihs)
+    float _sp_ihs    = f_sl_pat(_rs_inv.p, true, _ep_ihs, _t2_ihs)
+    bool  _val_ihs   = f_validate_pattern(_b_ihs, _ep_ihs, _sp_ihs, _t2_ihs)
+    if _has_hs and _rs.i > _l_neck_r.i and _l_neck_r.i > _head.i and _head.i > _l_neck_l.i and _l_neck_l.i > _ls.i
+        if _head.p > _rs.p and _head.p > _ls.p and f_isNear(_ls.p, _rs.p, sym_tol)
+            if f_isValidSize(_ht_hs, close) and not na(_b_hs) and not na(_ep_hs) and _val_hs and show_hs_std
+                res := PatternResult.new(detected=true, name="Head & Shoulders", isBullish=false,
+                     entryPrice=_ep_hs, stopPrice=_sp_hs, tp1=_t1_hs, tp2=_t2_hs, tp3=_t3_hs,
+                     start_idx=_ls.i, breakout_idx=_b_hs,
+                     fux1=_ls.i, fuy1=_head.p, fux2=_b_hs, fuy2=_na_hs,
+                     flx1=_l_neck_l.i, fly1=_l_neck_l.p, flx2=_b_hs, fly2=_na_hs,
+                     llx1=_l_neck_l.i, lly1=_l_neck_l.p, llx2=_b_hs, lly2=_na_hs)
+    if not res.detected and _has_ihs and _rs_inv.i > _h_neck_r.i and _h_neck_r.i > _head_inv.i and _head_inv.i > _h_neck_l.i and _h_neck_l.i > _ls_inv.i
+        if _head_inv.p < _rs_inv.p and _head_inv.p < _ls_inv.p and f_isNear(_ls_inv.p, _rs_inv.p, sym_tol)
+            if f_isValidSize(_ht_ihs, close) and not na(_b_ihs) and not na(_ep_ihs) and _val_ihs and show_hs_inv
+                res := PatternResult.new(detected=true, name="Inv Head & Shoulders", isBullish=true,
+                     entryPrice=_ep_ihs, stopPrice=_sp_ihs, tp1=_t1_ihs, tp2=_t2_ihs, tp3=_t3_ihs,
+                     start_idx=_ls_inv.i, breakout_idx=_b_ihs,
+                     fux1=_h_neck_l.i, fuy1=_h_neck_l.p, fux2=_b_ihs, fuy2=_na_ihs,
+                     flx1=_ls_inv.i, fly1=_head_inv.p, flx2=_b_ihs, fly2=_na_ihs,
+                     lux1=_h_neck_l.i, luy1=_h_neck_l.p, lux2=_b_ihs, luy2=_na_ihs)
+    res
+
+detectDouble() =>
+    res = PatternResult.new()
+    _has_dt  = pivotHighs.size() >= 2 and pivotLows.size() >= 1
+    _has_db  = pivotLows.size() >= 2 and pivotHighs.size() >= 1
+    _p1      = _has_dt ? pivotHighs.get(0) : Pivot.new(na, na)
+    _p2      = _has_dt ? pivotHighs.get(1) : Pivot.new(na, na)
+    _mid     = _has_dt ? pivotLows.get(0)  : Pivot.new(na, na)
+    _p1b     = _has_db ? pivotLows.get(0)   : Pivot.new(na, na)
+    _p2b     = _has_db ? pivotLows.get(1)   : Pivot.new(na, na)
+    _mid_b   = _has_db ? pivotHighs.get(0)  : Pivot.new(na, na)
+    int   _b_dt   = f_get_break_idx_precise(_mid.i, _mid.p, bar_index, _mid.p, false)
+    int   _b_db   = f_get_break_idx_precise(_mid_b.i, _mid_b.p, bar_index, _mid_b.p, true)
+    float _ep_dt  = f_get_entry_price(_b_dt)
+    float _avg_top = (nz(_p1.p) + nz(_p2.p)) / 2
+    float _ht_dt  = _avg_top - nz(_mid.p)
+    [_t1_dt, _t2_dt, _t3_dt] = f_tps(_ep_dt, false, _b_dt)
+    float _sp_dt  = f_sl_pat(math.max(nz(_p1.p), nz(_p2.p)), false, _ep_dt, _t2_dt)
+    bool  _val_dt = f_validate_pattern(_b_dt, _ep_dt, _sp_dt, _t2_dt)
+    float _ep_db  = f_get_entry_price(_b_db)
+    float _avg_bot = (nz(_p1b.p) + nz(_p2b.p)) / 2
+    float _ht_db  = nz(_mid_b.p) - _avg_bot
+    [_t1_db, _t2_db, _t3_db] = f_tps(_ep_db, true, _b_db)
+    float _sp_db  = f_sl_pat(math.min(nz(_p1b.p), nz(_p2b.p)), true, _ep_db, _t2_db)
+    bool  _val_db = f_validate_pattern(_b_db, _ep_db, _sp_db, _t2_db)
+    if _has_dt and _p1.i > _mid.i and _mid.i > _p2.i and f_isNear(_p1.p, _p2.p, lvl_tol)
+        if f_isValidSize(_ht_dt, close) and not na(_b_dt) and not na(_ep_dt) and _val_dt and show_dt_top
+            res := PatternResult.new(detected=true, name="Double Top", isBullish=false,
+                 entryPrice=_ep_dt, stopPrice=_sp_dt, tp1=_t1_dt, tp2=_t2_dt, tp3=_t3_dt,
+                 start_idx=_p2.i, breakout_idx=_b_dt,
+                 fux1=_p2.i, fuy1=_avg_top, fux2=_b_dt, fuy2=_avg_top,
+                 flx1=_mid.i, fly1=_mid.p, flx2=_b_dt, fly2=_mid.p,
+                 llx1=_mid.i, lly1=_mid.p, llx2=_b_dt, lly2=_mid.p)
+    if not res.detected and _has_db and _p1b.i > _mid_b.i and _mid_b.i > _p2b.i and f_isNear(_p1b.p, _p2b.p, lvl_tol)
+        if f_isValidSize(_ht_db, close) and not na(_b_db) and not na(_ep_db) and _val_db and show_dt_bot
+            res := PatternResult.new(detected=true, name="Double Bottom", isBullish=true,
+                 entryPrice=_ep_db, stopPrice=_sp_db, tp1=_t1_db, tp2=_t2_db, tp3=_t3_db,
+                 start_idx=_p2b.i, breakout_idx=_b_db,
+                 fux1=_mid_b.i, fuy1=_mid_b.p, fux2=_b_db, fuy2=_mid_b.p,
+                 flx1=_p2b.i, fly1=_avg_bot, flx2=_b_db, fly2=_avg_bot,
+                 lux1=_mid_b.i, luy1=_mid_b.p, lux2=_b_db, luy2=_mid_b.p)
+    res
+
+detectTriple() =>
+    res = PatternResult.new()
+    _has_tt  = pivotHighs.size() >= 3 and pivotLows.size() >= 2
+    _has_tb  = pivotLows.size() >= 3 and pivotHighs.size() >= 2
+    _h1      = _has_tt ? pivotHighs.get(0) : Pivot.new(na, na)
+    _h2      = _has_tt ? pivotHighs.get(1) : Pivot.new(na, na)
+    _h3      = _has_tt ? pivotHighs.get(2) : Pivot.new(na, na)
+    _l1t     = _has_tt ? pivotLows.get(0)  : Pivot.new(na, na)
+    _l2t     = _has_tt ? pivotLows.get(1)  : Pivot.new(na, na)
+    _l1b     = _has_tb ? pivotLows.get(0)   : Pivot.new(na, na)
+    _l2b     = _has_tb ? pivotLows.get(1)   : Pivot.new(na, na)
+    _l3b     = _has_tb ? pivotLows.get(2)   : Pivot.new(na, na)
+    _h1b     = _has_tb ? pivotHighs.get(0)  : Pivot.new(na, na)
+    _h2b     = _has_tb ? pivotHighs.get(1)  : Pivot.new(na, na)
+    float _neck_tt    = math.min(nz(_l1t.p), nz(_l2t.p))
+    float _ht_tt      = math.max(nz(_h1.p), math.max(nz(_h2.p), nz(_h3.p))) - _neck_tt
+    float _neck_tb    = math.max(nz(_h1b.p), nz(_h2b.p))
+    float _ht_tb      = _neck_tb - math.min(nz(_l1b.p), math.min(nz(_l2b.p), nz(_l3b.p)))
+    int   _b_tt       = f_get_break_idx_precise(_l2t.i, _l2t.p, _l1t.i, _l1t.p, false)
+    int   _b_tb       = f_get_break_idx_precise(_h2b.i, _neck_tb, _h1b.i, _neck_tb, true)
+    float _na_tt      = f_neck_at_break(_l2t.i, _l2t.p, _l1t.i, _l1t.p, nz(_b_tt))
+    float _na_tb      = f_neck_at_break(_h2b.i, _neck_tb, _h1b.i, _neck_tb, nz(_b_tb))
+    float _ep_tt      = f_get_entry_price(_b_tt)
+    float _ep_tb      = f_get_entry_price(_b_tb)
+    [_t1_tt, _t2_tt, _t3_tt] = f_tps(_ep_tt, false, _b_tt)
+    [_t1_tb, _t2_tb, _t3_tb] = f_tps(_ep_tb, true, _b_tb)
+    float _sp_tt      = f_sl_pat(math.max(nz(_h1.p), math.max(nz(_h2.p), nz(_h3.p))), false, _ep_tt, _t2_tt)
+    float _sp_tb      = f_sl_pat(math.min(nz(_l1b.p), math.min(nz(_l2b.p), nz(_l3b.p))), true, _ep_tb, _t2_tb)
+    bool  _val_tt     = f_validate_pattern(_b_tt, _ep_tt, _sp_tt, _t2_tt)
+    bool  _val_tb     = f_validate_pattern(_b_tb, _ep_tb, _sp_tb, _t2_tb)
+    if _has_tt and _h1.i > _l1t.i and _l1t.i > _h2.i and _h2.i > _l2t.i and _l2t.i > _h3.i
+        if f_isNear(_h1.p, _h2.p, lvl_tol) and f_isNear(_h2.p, _h3.p, lvl_tol)
+            if f_isValidSize(_ht_tt, close) and not na(_b_tt) and not na(_ep_tt) and _val_tt and show_tt_top
+                float _avg_top_tt = math.max(_h1.p, math.max(_h2.p, _h3.p))
+                res := PatternResult.new(detected=true, name="Triple Top", isBullish=false,
+                     entryPrice=_ep_tt, stopPrice=_sp_tt, tp1=_t1_tt, tp2=_t2_tt, tp3=_t3_tt,
+                     start_idx=_h3.i, breakout_idx=_b_tt,
+                     fux1=_h3.i, fuy1=_avg_top_tt, fux2=_b_tt, fuy2=_avg_top_tt,
+                     flx1=_l2t.i, fly1=_neck_tt, flx2=_b_tt, fly2=_na_tt,
+                     llx1=_l2t.i, lly1=_neck_tt, llx2=_b_tt, lly2=_na_tt)
+    if not res.detected and _has_tb and _l1b.i > _h1b.i and _h1b.i > _l2b.i and _l2b.i > _h2b.i and _h2b.i > _l3b.i
+        if f_isNear(_l1b.p, _l2b.p, lvl_tol) and f_isNear(_l2b.p, _l3b.p, lvl_tol)
+            if f_isValidSize(_ht_tb, close) and not na(_b_tb) and not na(_ep_tb) and _val_tb and show_tt_bot
+                float _avg_bot_tt = math.min(_l1b.p, math.min(_l2b.p, _l3b.p))
+                res := PatternResult.new(detected=true, name="Triple Bottom", isBullish=true,
+                     entryPrice=_ep_tb, stopPrice=_sp_tb, tp1=_t1_tb, tp2=_t2_tb, tp3=_t3_tb,
+                     start_idx=_l3b.i, breakout_idx=_b_tb,
+                     fux1=_h2b.i, fuy1=_neck_tb, fux2=_b_tb, fuy2=_na_tb,
+                     flx1=_l3b.i, fly1=_avg_bot_tt, flx2=_b_tb, fly2=_avg_bot_tt,
+                     lux1=_h2b.i, luy1=_neck_tb, lux2=_b_tb, luy2=_na_tb)
+    res
+
+// FIX #5: Cup & Handle con validación real de forma
+detectCupHandle() =>
+    res = PatternResult.new()
+    _has_cup  = pivotHighs.size() >= 2 and pivotLows.size() >= 2
+    _h_rim    = _has_cup ? pivotHighs.get(0) : Pivot.new(na, na)
+    _h_left   = _has_cup ? pivotHighs.get(1) : Pivot.new(na, na)
+    _l_handle = _has_cup ? pivotLows.get(0)  : Pivot.new(na, na)
+    _l_bot    = _has_cup ? pivotLows.get(1)  : Pivot.new(na, na)
+    _l_rim    = _has_cup ? pivotLows.get(0)  : Pivot.new(na, na)
+    _l_left   = _has_cup ? pivotLows.get(1)  : Pivot.new(na, na)
+    _h_handle = _has_cup ? pivotHighs.get(0) : Pivot.new(na, na)
+    _h_top    = _has_cup ? pivotHighs.get(1) : Pivot.new(na, na)
+    float _cup_h_std  = nz(_h_rim.p) - nz(_l_bot.p)
+    float _cup_h_inv  = nz(_h_top.p) - nz(_l_rim.p)
+    int   _b_cup      = f_get_break_idx_precise(_h_rim.i, _h_rim.p, bar_index, _h_rim.p, true)
+    int   _b_inv      = f_get_break_idx_precise(_l_rim.i, _l_rim.p, bar_index, _l_rim.p, false)
+    float _na_cup     = f_neck_at_break(_h_left.i, _h_left.p, _h_rim.i, _h_rim.p, nz(_b_cup))
+    float _na_inv     = f_neck_at_break(_l_left.i, _l_left.p, _l_rim.i, _l_rim.p, nz(_b_inv))
+    float _ep_cup     = f_get_entry_price(_b_cup)
+    float _ep_inv     = f_get_entry_price(_b_inv)
+    [_t1_cup, _t2_cup, _t3_cup] = f_tps(_ep_cup, true, _b_cup)
+    [_t1_inv, _t2_inv, _t3_inv] = f_tps(_ep_inv, false, _b_inv)
+    float _sp_cup     = f_sl_pat(_l_handle.p, true, _ep_cup, _t2_cup)
+    float _sp_inv     = f_sl_pat(_h_handle.p, false, _ep_inv, _t2_inv)
+    bool  _val_cup    = f_validate_pattern(_b_cup, _ep_cup, _sp_cup, _t2_cup)
+    bool  _val_inv    = f_validate_pattern(_b_inv, _ep_inv, _sp_inv, _t2_inv)
+    // Validaciones de forma: profundidad de taza, retroceso del handle y proporción de duraciones
+    float _depth_std      = nz(_h_rim.p) > 0 ? _cup_h_std / nz(_h_rim.p) : 0.0
+    float _hdl_retr_std   = _cup_h_std > 0 ? (nz(_h_rim.p) - nz(_l_handle.p)) / _cup_h_std : 1.0
+    int   _cup_dur_std    = nz(_h_rim.i) - nz(_h_left.i)
+    int   _hdl_dur_std    = nz(_b_cup)   - nz(_h_rim.i)
+    bool  _shape_std      = _depth_std >= 0.03 and _depth_std <= 0.50 and _hdl_retr_std <= 0.50 and _hdl_dur_std > 0 and _cup_dur_std > 0 and _hdl_dur_std <= _cup_dur_std
+    float _depth_inv      = nz(_h_top.p) > 0 ? _cup_h_inv / nz(_h_top.p) : 0.0
+    float _hdl_retr_inv   = _cup_h_inv > 0 ? (nz(_h_handle.p) - nz(_l_rim.p)) / _cup_h_inv : 1.0
+    int   _cup_dur_inv    = nz(_l_rim.i) - nz(_l_left.i)
+    int   _hdl_dur_inv    = nz(_b_inv)   - nz(_l_rim.i)
+    bool  _shape_inv      = _depth_inv >= 0.03 and _depth_inv <= 0.50 and _hdl_retr_inv <= 0.50 and _hdl_dur_inv > 0 and _cup_dur_inv > 0 and _hdl_dur_inv <= _cup_dur_inv
+    if _has_cup and _l_handle.i > _h_rim.i and _h_rim.i > _l_bot.i and _l_bot.i > _h_left.i
+        if f_isNear(_h_rim.p, _h_left.p, sym_tol) and _l_handle.p > _l_bot.p and _l_handle.p < _h_rim.p and _shape_std
+            if f_isValidSize(_cup_h_std, close) and not na(_b_cup) and not na(_ep_cup) and _val_cup and show_cup_std
+                res := PatternResult.new(detected=true, name="Cup & Handle", isBullish=true,
+                     entryPrice=_ep_cup, stopPrice=_sp_cup, tp1=_t1_cup, tp2=_t2_cup, tp3=_t3_cup,
+                     start_idx=_h_left.i, breakout_idx=_b_cup,
+                     fux1=_h_left.i, fuy1=_h_left.p, fux2=_b_cup, fuy2=_na_cup,
+                     flx1=_h_left.i, fly1=_l_bot.p, flx2=_b_cup, fly2=_l_handle.p,
+                     lux1=_h_left.i, luy1=_h_rim.p, lux2=_b_cup, luy2=_na_cup)
+    if not res.detected and _has_cup and _h_handle.i > _l_rim.i and _l_rim.i > _h_top.i and _h_top.i > _l_left.i
+        if f_isNear(_l_rim.p, _l_left.p, sym_tol) and _h_handle.p < _h_top.p and _h_handle.p > _l_rim.p and _shape_inv
+            if f_isValidSize(_cup_h_inv, close) and not na(_b_inv) and not na(_ep_inv) and _val_inv and show_cup_inv
+                res := PatternResult.new(detected=true, name="Inv Cup & Handle", isBullish=false,
+                     entryPrice=_ep_inv, stopPrice=_sp_inv, tp1=_t1_inv, tp2=_t2_inv, tp3=_t3_inv,
+                     start_idx=_l_left.i, breakout_idx=_b_inv,
+                     fux1=_l_left.i, fuy1=_h_top.p, fux2=_b_inv, fuy2=_h_handle.p,
+                     flx1=_l_left.i, fly1=_l_left.p, flx2=_b_inv, fly2=_na_inv,
+                     llx1=_l_left.i, lly1=_l_rim.p, llx2=_b_inv, lly2=_na_inv)
+    res
+
+// FIX #1 + #6: paralelismo con f_isNear corregido, pendientes normalizadas por ATR
+// y verificación de la DIRECCIÓN real del asta (desplazamiento con signo, no rango)
+detectFlagPennant() =>
+    res = PatternResult.new()
+    _has = pivotHighs.size() >= 2 and pivotLows.size() >= 2
+    _h1  = _has ? pivotHighs.get(0) : Pivot.new(na, na)
+    _h2  = _has ? pivotHighs.get(1) : Pivot.new(na, na)
+    _l1  = _has ? pivotLows.get(0)  : Pivot.new(na, na)
+    _l2  = _has ? pivotLows.get(1)  : Pivot.new(na, na)
+    int   _start_bar  = math.min(nz(_h2.i), nz(_l2.i))
+    int   _pole_len   = math.max(1, math.min(200, bar_index - _start_bar + 1))
+    // FIX #6: desplazamiento con signo — define la dirección del asta
+    float _pole_dir   = close - nz(close[_pole_len], close)
+    bool  _pole_up    = _pole_dir >  atr_val * 3
+    bool  _pole_dn    = _pole_dir < -atr_val * 3
+    float _slope_u    = _h1.i == _h2.i ? 0.0 : (nz(_h1.p) - nz(_h2.p)) / math.max(1, _h1.i - _h2.i)
+    float _slope_l    = _l1.i == _l2.i ? 0.0 : (nz(_l1.p) - nz(_l2.p)) / math.max(1, _l1.i - _l2.i)
+    // FIX #7: pendientes normalizadas (ATR por barra) → portable entre timeframes
+    float _su_n       = atr_val > 0 ? _slope_u / atr_val : 0.0
+    float _sl_n       = atr_val > 0 ? _slope_l / atr_val : 0.0
+    bool  _parallel   = f_isNear(_su_n, _sl_n, 0.2)
+    int   _b_bull     = f_get_break_idx_precise(_h2.i, _h2.p, _h1.i, _h1.p, true)
+    int   _b_bear     = f_get_break_idx_precise(_l2.i, _l2.p, _l1.i, _l1.p, false)
+    float _ub_bull    = f_project(_h2.i, _h2.p, _h1.i, _h1.p, nz(_b_bull))
+    float _lb_bull    = f_project(_l2.i, _l2.p, _l1.i, _l1.p, nz(_b_bull))
+    float _ub_bear    = f_project(_h2.i, _h2.p, _h1.i, _h1.p, nz(_b_bear))
+    float _lb_bear    = f_project(_l2.i, _l2.p, _l1.i, _l1.p, nz(_b_bear))
+    float _ep_bull    = f_get_entry_price(_b_bull)
+    float _ep_bear    = f_get_entry_price(_b_bear)
+    [_t1_bull, _t2_bull, _t3_bull] = f_tps(_ep_bull, true, _b_bull)
+    [_t1_bear, _t2_bear, _t3_bear] = f_tps(_ep_bear, false, _b_bear)
+    float _sp_bull    = f_sl_pat(_lb_bull, true, _ep_bull, _t2_bull)
+    float _sp_bear    = f_sl_pat(_ub_bear, false, _ep_bear, _t2_bear)
+    bool  _val_bull   = f_validate_pattern(_b_bull, _ep_bull, _sp_bull, _t2_bull)
+    bool  _val_bear   = f_validate_pattern(_b_bear, _ep_bear, _sp_bear, _t2_bear)
+    if _has
+        // Bandera alcista: asta ALCISTA + consolidación con pendiente bajista
+        if _pole_up and _slope_u < 0 and _slope_l < 0
+            if not na(_b_bull) and not na(_ep_bull) and _val_bull
+                if (_parallel and show_flag_bull) or (not _parallel and show_pennant_bull)
+                    res := PatternResult.new(detected=true, name=_parallel ? "Bullish Flag" : "Bullish Pennant", isBullish=true,
+                         entryPrice=_ep_bull, stopPrice=_sp_bull, tp1=_t1_bull, tp2=_t2_bull, tp3=_t3_bull,
+                         start_idx=_h2.i, breakout_idx=_b_bull,
+                         fux1=_h2.i, fuy1=_h2.p, fux2=_b_bull, fuy2=_ub_bull,
+                         flx1=_l2.i, fly1=_l2.p, flx2=_b_bull, fly2=_lb_bull)
+        // Bandera bajista: asta BAJISTA + consolidación con pendiente alcista
+        else if _pole_dn and _slope_u > 0 and _slope_l > 0
+            if not na(_b_bear) and not na(_ep_bear) and _val_bear
+                if (_parallel and show_flag_bear) or (not _parallel and show_pennant_bear)
+                    res := PatternResult.new(detected=true, name=_parallel ? "Bearish Flag" : "Bearish Pennant", isBullish=false,
+                         entryPrice=_ep_bear, stopPrice=_sp_bear, tp1=_t1_bear, tp2=_t2_bear, tp3=_t3_bear,
+                         start_idx=_h2.i, breakout_idx=_b_bear,
+                         fux1=_h2.i, fuy1=_h2.p, fux2=_b_bear, fuy2=_ub_bear,
+                         flx1=_l2.i, fly1=_l2.p, flx2=_b_bear, fly2=_lb_bear)
+    if res.detected
+        int   _sb  = math.min(_h2.i, _l2.i)
+        int   _bi  = res.breakout_idx
+        float _ubs = f_project(_h2.i, _h2.p, _h1.i, _h1.p, _bi)
+        float _lbs = f_project(_l2.i, _l2.p, _l1.i, _l1.p, _bi)
+        float _uss = f_project(_h2.i, _h2.p, _h1.i, _h1.p, _sb)
+        float _lss = f_project(_l2.i, _l2.p, _l1.i, _l1.p, _sb)
+        res.fux1  := _sb
+        res.fuy1  := _uss
+        res.fux2  := _bi
+        res.fuy2  := _ubs
+        res.flx1  := _sb
+        res.fly1  := _lss
+        res.flx2  := _bi
+        res.fly2  := _lbs
+        res.lux1  := _sb
+        res.luy1  := _uss
+        res.lux2  := _bi
+        res.luy2  := _ubs
+        res.llx1  := _sb
+        res.lly1  := _lss
+        res.llx2  := _bi
+        res.lly2  := _lbs
+    res
+
+detectWedge() =>
+    res = PatternResult.new()
+    _has = pivotHighs.size() >= 2 and pivotLows.size() >= 2
+    _h1  = _has ? pivotHighs.get(0) : Pivot.new(na, na)
+    _h2  = _has ? pivotHighs.get(1) : Pivot.new(na, na)
+    _l1  = _has ? pivotLows.get(0)  : Pivot.new(na, na)
+    _l2  = _has ? pivotLows.get(1)  : Pivot.new(na, na)
+    float _slope_u  = _h1.i == _h2.i ? 0.0 : (nz(_h1.p) - nz(_h2.p)) / math.max(1, _h1.i - _h2.i)
+    float _slope_l  = _l1.i == _l2.i ? 0.0 : (nz(_l1.p) - nz(_l2.p)) / math.max(1, _l1.i - _l2.i)
+    float _proj_u_now = f_project(_h2.i, _h2.p, _h1.i, _h1.p, bar_index)
+    float _proj_l_now = f_project(_l2.i, _l2.p, _l1.i, _l1.p, bar_index)
+    float _height_now = _proj_u_now - _proj_l_now
+    int   _b_fall   = f_get_break_idx_precise(_h2.i, _h2.p, _h1.i, _h1.p, true)
+    int   _b_rise   = f_get_break_idx_precise(_l2.i, _l2.p, _l1.i, _l1.p, false)
+    float _ub_rise  = f_project(_h2.i, _h2.p, _h1.i, _h1.p, nz(_b_rise))
+    float _lb_fall  = f_project(_l2.i, _l2.p, _l1.i, _l1.p, nz(_b_fall))
+    float _ep_fall  = f_get_entry_price(_b_fall)
+    float _ep_rise  = f_get_entry_price(_b_rise)
+    [_t1_fall, _t2_fall, _t3_fall] = f_tps(_ep_fall, true, _b_fall)
+    [_t1_rise, _t2_rise, _t3_rise] = f_tps(_ep_rise, false, _b_rise)
+    float _sp_fall  = f_sl_pat(_lb_fall, true, _ep_fall, _t2_fall)
+    float _sp_rise  = f_sl_pat(_ub_rise, false, _ep_rise, _t2_rise)
+    bool  _val_fall = f_validate_pattern(_b_fall, _ep_fall, _sp_fall, _t2_fall)
+    bool  _val_rise = f_validate_pattern(_b_rise, _ep_rise, _sp_rise, _t2_rise)
+    if _has and _height_now > 0
+        if _slope_u < 0 and _slope_l < 0 and _slope_l < _slope_u
+            if not na(_b_fall) and not na(_ep_fall) and _val_fall and show_wedge_fall
+                res := PatternResult.new(detected=true, name="Falling Wedge", isBullish=true,
+                     entryPrice=_ep_fall, stopPrice=_sp_fall, tp1=_t1_fall, tp2=_t2_fall, tp3=_t3_fall,
+                     start_idx=_h2.i, breakout_idx=_b_fall)
+        else if _slope_u > 0 and _slope_l > 0 and _slope_l > _slope_u
+            if not na(_b_rise) and not na(_ep_rise) and _val_rise and show_wedge_rise
+                res := PatternResult.new(detected=true, name="Rising Wedge", isBullish=false,
+                     entryPrice=_ep_rise, stopPrice=_sp_rise, tp1=_t1_rise, tp2=_t2_rise, tp3=_t3_rise,
+                     start_idx=_h2.i, breakout_idx=_b_rise)
+    if res.detected
+        int   _sb  = math.min(_h2.i, _l2.i)
+        int   _bi  = res.breakout_idx
+        float _ubs = f_project(_h2.i, _h2.p, _h1.i, _h1.p, _bi)
+        float _lbs = f_project(_l2.i, _l2.p, _l1.i, _l1.p, _bi)
+        float _uss = f_project(_h2.i, _h2.p, _h1.i, _h1.p, _sb)
+        float _lss = f_project(_l2.i, _l2.p, _l1.i, _l1.p, _sb)
+        res.fux1  := _h2.i
+        res.fuy1  := _h2.p
+        res.fux2  := _bi
+        res.fuy2  := _ubs
+        res.flx1  := _l2.i
+        res.fly1  := _l2.p
+        res.flx2  := _bi
+        res.fly2  := _lbs
+        res.lux1  := _sb
+        res.luy1  := _uss
+        res.lux2  := _bi
+        res.luy2  := _ubs
+        res.llx1  := _sb
+        res.lly1  := _lss
+        res.llx2  := _bi
+        res.lly2  := _lbs
+    res
+
+detectTriangles() =>
+    res = PatternResult.new()
+    _has = pivotHighs.size() >= 2 and pivotLows.size() >= 2
+    _h1  = _has ? pivotHighs.get(0) : Pivot.new(na, na)
+    _h2  = _has ? pivotHighs.get(1) : Pivot.new(na, na)
+    _l1  = _has ? pivotLows.get(0)  : Pivot.new(na, na)
+    _l2  = _has ? pivotLows.get(1)  : Pivot.new(na, na)
+    float _slope_u   = _h1.i == _h2.i ? 0.0 : (nz(_h1.p) - nz(_h2.p)) / math.max(1, _h1.i - _h2.i)
+    float _slope_l   = _l1.i == _l2.i ? 0.0 : (nz(_l1.p) - nz(_l2.p)) / math.max(1, _l1.i - _l2.i)
+    // FIX #7: tolerancia de "plano" en unidades de ATR por barra (adimensional entre timeframes)
+    float _su_n      = atr_val > 0 ? _slope_u / atr_val : 0.0
+    float _sl_n      = atr_val > 0 ? _slope_l / atr_val : 0.0
+    float _flat_tol_n = 0.03
+    int   _start_tri = math.min(nz(_h2.i), nz(_l2.i))
+    float _base_height = math.abs(f_project(_h2.i, _h2.p, _h1.i, _h1.p, _start_tri) - f_project(_l2.i, _l2.p, _l1.i, _l1.p, _start_tri))
+    bool  _converging = f_project(_h2.i, _h2.p, _h1.i, _h1.p, bar_index) > f_project(_l2.i, _l2.p, _l1.i, _l1.p, bar_index)
+    int   _b_bull    = f_get_break_idx_precise(_h2.i, _h2.p, _h1.i, _h1.p, true)
+    int   _b_bear    = f_get_break_idx_precise(_l2.i, _l2.p, _l1.i, _l1.p, false)
+    float _ub_bear   = f_project(_h2.i, _h2.p, _h1.i, _h1.p, nz(_b_bear))
+    float _lb_bull   = f_project(_l2.i, _l2.p, _l1.i, _l1.p, nz(_b_bull))
+    float _ep_bull   = f_get_entry_price(_b_bull)
+    float _ep_bear   = f_get_entry_price(_b_bear)
+    [_t1_bull, _t2_bull, _t3_bull] = f_tps(_ep_bull, true, _b_bull)
+    [_t1_bear, _t2_bear, _t3_bear] = f_tps(_ep_bear, false, _b_bear)
+    float _sp_bull   = f_sl_pat(_lb_bull, true, _ep_bull, _t2_bull)
+    float _sp_bear   = f_sl_pat(_ub_bear, false, _ep_bear, _t2_bear)
+    bool  _val_bull  = f_validate_pattern(_b_bull, _ep_bull, _sp_bull, _t2_bull)
+    bool  _val_bear  = f_validate_pattern(_b_bear, _ep_bear, _sp_bear, _t2_bear)
+    if _has and _converging and f_isValidSize(_base_height, close)
+        if (_su_n < 0 and _sl_n > 0) or (math.abs(_su_n) < _flat_tol_n and _sl_n > 0)
+            if not na(_b_bull) and not na(_ep_bull) and _val_bull and show_tri_gen
+                bool _isAsc = math.abs(_su_n) < _flat_tol_n
+                res := PatternResult.new(detected=true, name=_isAsc ? "Ascending Triangle" : "Symmetrical Triangle", isBullish=true,
+                     entryPrice=_ep_bull, stopPrice=_sp_bull, tp1=_t1_bull, tp2=_t2_bull, tp3=_t3_bull,
+                     start_idx=_h2.i, breakout_idx=_b_bull)
+        if not res.detected and ((_su_n < 0 and _sl_n > 0) or (_su_n < 0 and math.abs(_sl_n) < _flat_tol_n))
+            if not na(_b_bear) and not na(_ep_bear) and _val_bear and show_tri_gen
+                bool _isDesc = math.abs(_sl_n) < _flat_tol_n
+                res := PatternResult.new(detected=true, name=_isDesc ? "Descending Triangle" : "Symmetrical Triangle", isBullish=false,
+                     entryPrice=_ep_bear, stopPrice=_sp_bear, tp1=_t1_bear, tp2=_t2_bear, tp3=_t3_bear,
+                     start_idx=_h2.i, breakout_idx=_b_bear)
+    if res.detected
+        int   _sb  = math.min(_h2.i, _l2.i)
+        int   _bi  = res.breakout_idx
+        float _ubs = f_project(_h2.i, _h2.p, _h1.i, _h1.p, _bi)
+        float _lbs = f_project(_l2.i, _l2.p, _l1.i, _l1.p, _bi)
+        float _uss = f_project(_h2.i, _h2.p, _h1.i, _h1.p, _sb)
+        float _lss = f_project(_l2.i, _l2.p, _l1.i, _l1.p, _sb)
+        res.fux1  := _h2.i
+        res.fuy1  := _h2.p
+        res.fux2  := _bi
+        res.fuy2  := _ubs
+        res.flx1  := _l2.i
+        res.fly1  := _l2.p
+        res.flx2  := _bi
+        res.fly2  := _lbs
+        res.lux1  := _sb
+        res.luy1  := _uss
+        res.lux2  := _bi
+        res.luy2  := _ubs
+        res.llx1  := _sb
+        res.lly1  := _lss
+        res.llx2  := _bi
+        res.lly2  := _lbs
+    res
+
+detectRectangles() =>
+    res = PatternResult.new()
+    _has = pivotHighs.size() >= 2 and pivotLows.size() >= 2
+    _h1  = _has ? pivotHighs.get(0) : Pivot.new(na, na)
+    _h2  = _has ? pivotHighs.get(1) : Pivot.new(na, na)
+    _l1  = _has ? pivotLows.get(0)  : Pivot.new(na, na)
+    _l2  = _has ? pivotLows.get(1)  : Pivot.new(na, na)
+    float _slope_u   = _h1.i == _h2.i ? 0.0 : (nz(_h1.p) - nz(_h2.p)) / math.max(1, _h1.i - _h2.i)
+    float _slope_l   = _l1.i == _l2.i ? 0.0 : (nz(_l1.p) - nz(_l2.p)) / math.max(1, _l1.i - _l2.i)
+    float _su_n      = atr_val > 0 ? _slope_u / atr_val : 0.0
+    float _sl_n      = atr_val > 0 ? _slope_l / atr_val : 0.0
+    bool  _is_flat   = math.abs(_su_n) < 0.05 and math.abs(_sl_n) < 0.05
+    int   _start_rect = math.min(nz(_h2.i), nz(_l2.i))
+    float _avg_top   = (nz(_h1.p) + nz(_h2.p)) / 2
+    float _avg_bot   = (nz(_l1.p) + nz(_l2.p)) / 2
+    float _height    = _avg_top - _avg_bot
+    int   _b_bull    = f_get_break_idx_precise(_start_rect, _avg_top, bar_index, _avg_top, true)
+    int   _b_bear    = f_get_break_idx_precise(_start_rect, _avg_bot, bar_index, _avg_bot, false)
+    float _ep_bull   = f_get_entry_price(_b_bull)
+    float _ep_bear   = f_get_entry_price(_b_bear)
+    [_t1_bull, _t2_bull, _t3_bull] = f_tps(_ep_bull, true, _b_bull)
+    [_t1_bear, _t2_bear, _t3_bear] = f_tps(_ep_bear, false, _b_bear)
+    float _sp_bull   = f_sl_pat(_avg_bot, true, _ep_bull, _t2_bull)
+    float _sp_bear   = f_sl_pat(_avg_top, false, _ep_bear, _t2_bear)
+    bool  _val_bull  = f_validate_pattern(_b_bull, _ep_bull, _sp_bull, _t2_bull)
+    bool  _val_bear  = f_validate_pattern(_b_bear, _ep_bear, _sp_bear, _t2_bear)
+    if _has and _is_flat and f_isValidSize(_height, close)
+        if not na(_b_bull) and not na(_ep_bull) and _val_bull and show_rect_gen
+            res := PatternResult.new(detected=true, name="Rectangle", isBullish=true,
+                 entryPrice=_ep_bull, stopPrice=_sp_bull, tp1=_t1_bull, tp2=_t2_bull, tp3=_t3_bull,
+                 start_idx=_h2.i, breakout_idx=_b_bull,
+                 fux1=_start_rect, fuy1=_avg_top, fux2=_b_bull, fuy2=_avg_top,
+                 flx1=_start_rect, fly1=_avg_bot, flx2=_b_bull, fly2=_avg_bot)
+        if not res.detected and not na(_b_bear) and not na(_ep_bear) and _val_bear and show_rect_gen
+            res := PatternResult.new(detected=true, name="Rectangle", isBullish=false,
+                 entryPrice=_ep_bear, stopPrice=_sp_bear, tp1=_t1_bear, tp2=_t2_bear, tp3=_t3_bear,
+                 start_idx=_h2.i, breakout_idx=_b_bear,
+                 fux1=_start_rect, fuy1=_avg_top, fux2=_b_bear, fuy2=_avg_top,
+                 flx1=_start_rect, fly1=_avg_bot, flx2=_b_bear, fly2=_avg_bot)
+    if res.detected
+        int _sb = math.min(_h2.i, _l2.i)
+        int _bi = res.breakout_idx
+        res.lux1 := _sb
+        res.luy1 := _avg_top
+        res.lux2 := _bi
+        res.luy2 := _avg_top
+        res.llx1 := _sb
+        res.lly1 := _avg_bot
+        res.llx2 := _bi
+        res.lly2 := _avg_bot
+    res
+
+// ── PIVOT COLLECTION ─────────────────────────────────────────────────────────
+// ── CARGA DEL MODELO FEDERADO (una sola vez, en la primera barra) ────────────
+var bool FED_LOADED = false
+var bool FED_OK     = false
+bool fed_wants_import = fed_mode != "Local (entrenar)"
+bool fed_can_train    = fed_mode != "Importado (solo inferir)"
+
+if barstate.isfirst and fed_wants_import and not FED_LOADED
+    FED_LOADED := true
+    array<float> _w  = f_csv_to_arr(w_import,    N_FEAT)
+    array<float> _mu = f_csv_to_arr(mean_import, N_FEAT)
+    array<float> _sd = f_csv_to_arr(sd_import,   N_FEAT)
+    if not na(_w) and not na(_mu) and not na(_sd)
+        for i = 0 to N_FEAT - 1
+            W.set(i, _w.get(i))
+            F_MEAN.set(i, _mu.get(i))
+            // Se reconstruye M2 a partir de SD y n: M2 = sd² · (n−1)
+            F_M2.set(i, math.pow(_sd.get(i), 2) * math.max(1, n_import - 1))
+        CNT.set(0, math.max(1, n_import))
+        // CNT[1] cuenta SIEMPRE solo los trades entrenados localmente. Las muestras del
+        // modelo importado se suman aparte (n_import) donde hagan falta: sembrarlas aquí
+        // las contaba dos veces en el gate, porque allí ya se sumaba n_import.
+        CNT.set(1, 0.0)
+        FED_OK := true
+    // TP/SL consolidados entre activos (en unidades ATR — transferibles)
+    array<float> _tp = f_csv_to_arr(tp_import, 4)
+    if not na(_tp)
+        ADAPT_TP1 := _tp.get(0)
+        ADAPT_TP2 := _tp.get(1)
+        ADAPT_TP3 := _tp.get(2)
+        ADAPT_SL  := _tp.get(3)
+
+// FIX #3: pivotes nativos — left y right consistentes con el índice registrado
+float ph = ta.pivothigh(high, lb_left, lb_right)
+float pl = ta.pivotlow(low, lb_left, lb_right)
+if not na(ph)
+    pivotHighs.unshift(Pivot.new(ph, bar_index - lb_right))
+    if pivotHighs.size() > max_piv_hist
+        pivotHighs.pop()
+if not na(pl)
+    pivotLows.unshift(Pivot.new(pl, bar_index - lb_right))
+    if pivotLows.size() > max_piv_hist
+        pivotLows.pop()
+bool has_pivots = pivotHighs.size() >= 2 and pivotLows.size() >= 2
+
+// ── PATTERN ENGINE & SIGNAL DISPATCH ─────────────────────────────────────────
+var int last_idx = 0
+var int frozen_start_idx = na
+var int frozen_breakout_idx = na
+
+// FIX #17: warm-up dinámico en lugar del mágico 600
+int warmup = math.max(trend_filter_on ? trend_len : 200, (lb_left + lb_right) * 4)
+bool _gate = bar_index > warmup and has_pivots
+
+// FIX #11: cada detector solo se ejecuta si su familia de toggles está activa
+PatternResult _r_hs   = _gate and (show_hs_std or show_hs_inv)                                              ? detectHS()          : PatternResult.new()
+PatternResult _r_tri  = _gate and (show_tt_top or show_tt_bot)                                              ? detectTriple()      : PatternResult.new()
+PatternResult _r_cup  = _gate and (show_cup_std or show_cup_inv)                                            ? detectCupHandle()   : PatternResult.new()
+PatternResult _r_dbl  = _gate and (show_dt_top or show_dt_bot)                                              ? detectDouble()      : PatternResult.new()
+PatternResult _r_wdg  = _gate and (show_wedge_rise or show_wedge_fall)                                      ? detectWedge()       : PatternResult.new()
+PatternResult _r_trng = _gate and show_tri_gen                                                              ? detectTriangles()   : PatternResult.new()
+PatternResult _r_fp   = _gate and (show_flag_bull or show_flag_bear or show_pennant_bull or show_pennant_bear) ? detectFlagPennant() : PatternResult.new()
+PatternResult _r_rect = _gate and show_rect_gen                                                             ? detectRectangles()  : PatternResult.new()
+
+// FIX #4: prioridad del patrón MÁS específico al MÁS general
+PatternResult res = PatternResult.new()
+if _gate
+    if _r_hs.detected
+        res := _r_hs
+    else if _r_tri.detected
+        res := _r_tri
+    else if _r_cup.detected
+        res := _r_cup
+    else if _r_dbl.detected
+        res := _r_dbl
+    else if _r_wdg.detected
+        res := _r_wdg
+    else if _r_trng.detected
+        res := _r_trng
+    else if _r_fp.detected
+        res := _r_fp
+    else if _r_rect.detected
+        res := _r_rect
+
+// ── VALIDACIÓN GEOMÉTRICA GLOBAL ─────────────────────────────────────────────
+// Descarta patrones absurdamente anchos/estrechos y "triángulos" que en realidad
+// son dos rectas al azar por las que el precio nunca estuvo contenido.
+if res.detected
+    if not f_valid_width(res.start_idx, res.breakout_idx)
+        res := PatternResult.new()
+if res.detected and containment_en and not na(res.fux1) and not na(res.flx1)
+    if not f_contained(res.fux1, res.fuy1, res.fux2, res.fuy2, res.flx1, res.fly1, res.flx2, res.fly2)
+        res := PatternResult.new()
+
+// MEJORA: filtro de tendencia — evaluado en la barra del breakout, no en la de detección
+if res.detected and trend_filter_on
+    int _offs_t = math.max(0, bar_index - nz(res.breakout_idx))
+    bool _trend_ok = res.isBullish ? close[_offs_t] > ema_trend[_offs_t] : close[_offs_t] < ema_trend[_offs_t]
+    if not _trend_ok
+        res := PatternResult.new()
+
+// MEJORA: filtro de latencia — si la detección llega tarde, el trade ya no existe
+int _latency = res.detected ? bar_index - nz(res.breakout_idx) : na
+if res.detected and _latency > max_latency
+    res := PatternResult.new()
+
+// ── VECTOR DE FEATURES + INFERENCIA ──────────────────────────────────────────
+// Todas las features se leen EN LA BARRA DEL BREAKOUT (offset _fo), nunca con
+// datos posteriores. Todas normalizadas por ATR o adimensionales → portables.
+array<float> FEAT = array.new<float>(N_FEAT, 0.0)
+float _pwin = na
+if res.detected
+    FEAT := f_build_feats(res, _latency)
+    if ml_en
+        _pwin := f_predict(FEAT)
+    // El gate solo actúa cuando el modelo ya vio suficientes trades resueltos
+    if ml_en and ml_gate_en and (CNT.get(1) + (FED_OK ? n_import : 0)) >= ml_warm and not na(_pwin) and _pwin < ml_min_p
+        res := PatternResult.new()
+
+// ── TRADE TRACKER (máquina de estados + win-rate) ───────────────────────────
+if track_en and barstate.isconfirmed and open_trades.size() > 0
+    for i = open_trades.size() - 1 to 0
+        ActiveTrade t = open_trades.get(i)
+
+        // ── Registro continuo de excursiones (el dato que alimenta los TP adaptativos)
+        float _an = math.max(nz(t.atr0, atr_val), syminfo.mintick)
+        float _fav = t.isBull ? (high - t.entry) / _an : (t.entry - low)  / _an
+        float _adv = t.isBull ? (t.entry - low)  / _an : (high - t.entry) / _an
+        t.mfe := math.max(t.mfe, _fav)
+        t.mae := math.max(t.mae, _adv)
+
+        bool hit_sl = t.isBull ? low <= t.sl : high >= t.sl
+        bool hit_t1 = t.isBull ? high >= t.tp1 : low <= t.tp1
+        bool hit_t2 = t.isBull ? high >= t.tp2 : low <= t.tp2
+        bool hit_t3 = t.isBull ? high >= t.tp3 : low <= t.tp3
+        bool removed  = false
+        bool resolved = false     // ¿se puede etiquetar y entrenar?
+        float label   = na
+
+        if t.state == 0 and hit_sl
+            // Conservador: si SL y TP1 se tocan en la misma vela, cuenta como pérdida
+            stat_losses += 1
+            f_stat_add(stat_loss_map, t.name)
+            resolved := true
+            label    := 0.0
+            open_trades.remove(i)
+            removed  := true
+        if not removed
+            if t.state == 0 and hit_t1
+                t.state := 1
+                stat_wins += 1
+                f_stat_add(stat_wins_map, t.name)
+                resolved := true
+                label    := 1.0
+                // MAE de ganadores: cuánto fue en contra antes de funcionar
+                f_push_capped(MAE_WIN_MEM, t.mae, 200)
+                if be_after_tp1
+                    t.sl := t.entry
+            if t.state >= 1 and hit_sl
+                open_trades.remove(i)
+                removed := true
+            if not removed and t.state == 1 and hit_t2
+                t.state := 2
+                stat_tp2hits += 1
+            if not removed and t.state == 2 and hit_t3
+                stat_tp3hits += 1
+                open_trades.remove(i)
+                removed := true
+            if not removed and bar_index - t.birth > time_stop_bars
+                if t.state == 0
+                    stat_expired += 1
+                    resolved := true
+                    label    := 0.0      // expirar sin llegar a TP1 también es información
+                open_trades.remove(i)
+                removed := true
+
+        // ── APRENDIZAJE: solo al resolverse, con las features congeladas en la entrada
+        if resolved and ml_en and fed_can_train and not na(t.feats)
+            f_train(t.feats, label)
+        // Al cerrarse el trade, su excursión máxima alimenta la memoria de TP
+        if removed
+            f_push_capped(MFE_MEM, t.mfe, 200)
+
+    // Recalcular los multiplicadores adaptativos con la evidencia acumulada
+    if adapt_en and fed_can_train and MFE_MEM.size() >= adapt_min_n
+        ADAPT_TP1 := math.max(0.3, math.min(adapt_max_atr, f_quantile(MFE_MEM, adapt_q1)))
+        ADAPT_TP2 := math.max(0.5, math.min(adapt_max_atr, f_quantile(MFE_MEM, adapt_q2)))
+        ADAPT_TP3 := math.max(0.8, math.min(adapt_max_atr, f_quantile(MFE_MEM, adapt_q3)))
+    if adapt_sl_en and fed_can_train and MAE_WIN_MEM.size() >= adapt_min_n
+        // +20% de margen sobre el percentil: los ganadores rara vez excedieron esto
+        ADAPT_SL  := math.max(0.3, math.min(adapt_max_atr, f_quantile(MAE_WIN_MEM, adapt_sl_q) * 1.2))
+
+// ── SHADOW TRADES ────────────────────────────────────────────────────────────
+// El gráfico solo dibuja UN patrón, pero el cerebro necesita datos. Aquí se
+// registran en silencio TODOS los setups válidos detectados en esta barra:
+// no se dibujan, no generan alertas, solo alimentan el aprendizaje.
+// Esto convierte ~5 muestras por histórico en decenas o cientos.
+var array<int> SEEN_BRK = array.new<int>()
+
+f_try_shadow(PatternResult r) =>
+    if shadow_en and track_en and r.detected and not na(r.entryPrice) and not na(r.stopPrice)
+        int _lat = bar_index - nz(r.breakout_idx)
+        // Latencia de COSECHA (amplia), no la de operación (estricta)
+        if _lat <= harvest_lat and f_valid_width(r.start_idx, r.breakout_idx)
+            // Clave única por breakout+nombre: evita registrar el mismo setup dos veces
+            int _key = nz(r.breakout_idx) * 32 + str.length(r.name) + (r.isBullish ? 1 : 0)
+            if na(SEEN_BRK.indexof(_key)) or SEEN_BRK.indexof(_key) == -1
+                SEEN_BRK.push(_key)
+                while SEEN_BRK.size() > 400
+                    SEEN_BRK.shift()
+                if open_trades.size() < shadow_max
+                    int   _sfo = math.max(0, bar_index - nz(r.breakout_idx))
+                    float _sa  = math.max(nz(atr_val[_sfo], atr_val), syminfo.mintick)
+                    ActiveTrade _st = ActiveTrade.new(r.name, r.isBullish, r.entryPrice, r.stopPrice, r.tp1, r.tp2, r.tp3, bar_index)
+                    _st.feats := f_build_feats(r, _lat)
+                    _st.atr0  := _sa
+                    _st.pwin  := ml_en ? f_predict(_st.feats) : na
+                    open_trades.push(_st)
+
+if barstate.isconfirmed and shadow_en and _gate
+    // Nivel 0: los setups que ya calculó el motor con los pivotes más recientes
+    f_try_shadow(_r_hs)
+    f_try_shadow(_r_tri)
+    f_try_shadow(_r_cup)
+    f_try_shadow(_r_dbl)
+    f_try_shadow(_r_wdg)
+    f_try_shadow(_r_trng)
+    f_try_shadow(_r_fp)
+    f_try_shadow(_r_rect)
+
+    // Niveles 1..N: ROTACIÓN DE PIVOTES.
+    // Los detectores siempre leen pivotHighs.get(0..2) — o sea, solo los 2-3
+    // pivotes más recientes. Descartando temporalmente el más nuevo y volviendo
+    // a ejecutarlos, se exploran combinaciones más antiguas y se cosechan
+    // muchos más setups históricos para entrenar. Al terminar se restaura todo.
+    if harvest_depth > 0
+        array<Pivot> _phBak = pivotHighs.copy()
+        array<Pivot> _plBak = pivotLows.copy()
+        for _o = 1 to harvest_depth
+            if pivotHighs.size() > 4 and pivotLows.size() > 4
+                pivotHighs.shift()
+                pivotLows.shift()
+                f_try_shadow(detectDouble())
+                f_try_shadow(detectTriple())
+                f_try_shadow(detectHS())
+                f_try_shadow(detectTriangles())
+                f_try_shadow(detectFlagPennant())
+        pivotHighs := _phBak
+        pivotLows  := _plBak
+
+// ── RENDERING & DRAWING ──────────────────────────────────────────────────────
+bool _is_new_pattern = res.detected and barstate.isconfirmed and (na(frozen_start_idx) or math.abs(res.start_idx - frozen_start_idx) > cooldown) and (na(frozen_breakout_idx) or res.breakout_idx != frozen_breakout_idx)
+
+if _is_new_pattern
+    PatternDrawings current_pat = PatternDrawings.new(array.new_line(), array.new_label())
+
+    last_idx            := bar_index
+    frozen_start_idx    := res.start_idx
+    frozen_breakout_idx := res.breakout_idx
+    dash_pat_name    := res.name
+    dash_pat_bull    := res.isBullish
+    dash_last_bar    := last_idx
+    dash_entry       := res.entryPrice
+    dash_stop        := res.stopPrice
+    dash_tp2         := res.tp2
+    dash_latency     := _latency
+
+    // Latencia alta (>50% del máximo) → color de advertencia
+    color  col = _latency > max_latency / 2 ? col_pend : res.isBullish ? col_bull : col_bear
+    string txt = res.name
+
+    if not na(res.fux1) and not na(res.fuy1) and not na(res.fux2) and not na(res.fuy2)
+        f_fill_sliced(res.fux1, res.fuy1, res.fux2, res.fuy2, res.flx1, res.fly1, res.flx2, res.fly2, col, current_pat.lns)
+
+    if not na(res.lux1)
+        ln_u = line.new(res.lux1, res.luy1, res.lux2, res.luy2, color=col, width=2)
+        if extend_lines
+            line.set_extend(ln_u, extend.right)
+        array.push(current_pat.lns, ln_u)
+
+    if not na(res.llx1)
+        ln_l = line.new(res.llx1, res.lly1, res.llx2, res.lly2, color=col, width=2)
+        if extend_lines
+            line.set_extend(ln_l, extend.right)
+        array.push(current_pat.lns, ln_l)
+
+    if not na(res.start_idx) and not na(res.breakout_idx)
+        int   _cx      = (res.start_idx + res.breakout_idx) / 2
+        float _uy_mid  = not na(res.lux1) ? f_project(res.lux1, res.luy1, res.lux2, res.luy2, _cx) : not na(res.fux1) ? f_project(res.fux1, res.fuy1, res.fux2, res.fuy2, _cx) : na
+        float _ly_mid  = not na(res.llx1) ? f_project(res.llx1, res.lly1, res.llx2, res.lly2, _cx) : not na(res.flx1) ? f_project(res.flx1, res.fly1, res.flx2, res.fly2, _cx) : na
+        float _cy      = not na(_uy_mid) and not na(_ly_mid) ? (_uy_mid + _ly_mid) / 2 : not na(_uy_mid) ? _uy_mid : not na(_ly_mid) ? _ly_mid : na
+        if not na(_cy)
+            string _lbl_sz_ctr = lbl_scale_en ? (lbl_scale_sel == "Small" ? size.small : lbl_scale_sel == "Large" ? size.large : size.normal) : size.small
+            lbl = label.new(_cx, _cy, txt, color=color.rgb(0, 0, 0, 0), textcolor=color.white, style=label.style_label_center, size=_lbl_sz_ctr)
+            array.push(current_pat.lbls, lbl)
+
+    // MEJORA: alerta JSON con los 3 TP y la latencia
+    if alert_en and not na(res.entryPrice) and not na(res.tp1) and not na(res.stopPrice)
+        string _alert_json = "{" + str.format('"ticker":"{0}","pattern":"{1}","bias":"{2}","entry":{3},"tp1":{4},"tp2":{5},"tp3":{6},"sl":{7},"latency_bars":{8}', syminfo.tickerid, txt, res.isBullish ? "bull" : "bear", str.tostring(res.entryPrice, format.mintick), str.tostring(res.tp1, format.mintick), str.tostring(res.tp2, format.mintick), str.tostring(res.tp3, format.mintick), str.tostring(res.stopPrice, format.mintick), str.tostring(_latency)) + "}"
+        alert(_alert_json, alert.freq_once_per_bar_close)
+
+    // MEJORA: registrar el trade en el tracker
+    if track_en and not shadow_en and not na(res.entryPrice) and not na(res.stopPrice)
+        int   _fo2 = math.max(0, bar_index - nz(res.breakout_idx))
+        float _a02 = math.max(nz(atr_val[_fo2], atr_val), syminfo.mintick)
+        ActiveTrade _nt = ActiveTrade.new(res.name, res.isBullish, res.entryPrice, res.stopPrice, res.tp1, res.tp2, res.tp3, bar_index)
+        _nt.feats := FEAT.copy()     // copia: el vector se congela aquí y no se toca más
+        _nt.atr0  := _a02
+        _nt.pwin  := _pwin
+        open_trades.push(_nt)
+
+    if show_tgt and not na(res.breakout_idx) and not na(res.entryPrice) and not na(res.stopPrice) and not na(res.tp1)
+        int offs = bar_index - res.breakout_idx
+        if offs >= 1
+            int   _x1        = res.breakout_idx
+            int   _x2        = res.breakout_idx + 50
+            int   _lx        = _x2 + 1
+            float _ep        = res.entryPrice
+
+            float total_cost = SLIP_COST_ABS + _ep * commission_pct * 2
+            float risk_val   = math.abs(_ep - res.stopPrice)
+            float reward_adj = math.max(0, math.abs(res.tp2 - _ep) - total_cost)
+            float rr_adj     = risk_val == 0 ? 0 : reward_adj / risk_val
+
+            string _lbl_sz = lbl_scale_en ? (lbl_scale_sel == "Small" ? size.small : lbl_scale_sel == "Large" ? size.large : size.normal) : size.small
+
+            line  ln_entry = line.new(_x1, _ep,           _x2, _ep,           color=col_entry,  style=line.style_dashed, width=1)
+            line  ln_stop  = line.new(_x1, res.stopPrice, _x2, res.stopPrice, color=col_stop,   style=line.style_dashed, width=1)
+            line  ln_tp1   = line.new(_x1, res.tp1,       _x2, res.tp1,       color=col_target, style=line.style_dotted, width=1)
+            line  ln_tp2   = line.new(_x1, res.tp2,       _x2, res.tp2,       color=col_target, style=line.style_dashed, width=1)
+            line  ln_tp3   = line.new(_x1, res.tp3,       _x2, res.tp3,       color=col_target, style=line.style_solid,  width=1)
+
+            // Mientras el modelo no esté entrenado, su p(win) es ~50% para todo:
+            // mostrarlo como porcentaje induce a confiar en un número vacío.
+            bool _ml_ready = (CNT.get(1) + (FED_OK ? n_import : 0)) >= ml_warm
+            string _pw_str = not ml_en or na(_pwin) ? "" : _ml_ready ? "  🧠 " + str.tostring(math.round(_pwin * 100)) + "%" : "  🧠 s/d"
+            string _info = ui_label == "Mínimo" ?
+                 (txt + _pw_str + "  E " + str.tostring(_ep, format.mintick) + " | SL " + str.tostring(res.stopPrice, format.mintick) + " | R:R " + str.tostring(rr_adj, "#.#")) :
+                 ("▶ " + txt + "  ⏳" + str.tostring(_latency) + "b" + _pw_str +
+                 "\nEntry " + str.tostring(_ep, format.mintick) +
+                 "\nSL    " + str.tostring(res.stopPrice, format.mintick) +
+                 "\nTP1   " + str.tostring(res.tp1, format.mintick) + " (" + str.tostring(tp1_atr, "#.#") + "xATR)" +
+                 "\nTP2   " + str.tostring(res.tp2, format.mintick) + "  R:R " + str.tostring(rr_adj, "#.##") +
+                 "\nTP3   " + str.tostring(res.tp3, format.mintick) + " (" + str.tostring(tp3_atr, "#.#") + "xATR)")
+            if ui_label != "Oculto"
+                label lbl_info = label.new(_lx, _ep, _info, style=label.style_label_left, color=color.new(res.isBullish ? col_bull : col_bear, 85), textcolor=color.white, size=_lbl_sz, text_font_family=font.family_monospace)
+                array.push(current_pat.lbls, lbl_info)
+
+            array.push(current_pat.lns,  ln_entry)
+            array.push(current_pat.lns,  ln_stop)
+            array.push(current_pat.lns,  ln_tp1)
+            array.push(current_pat.lns,  ln_tp2)
+            array.push(current_pat.lns,  ln_tp3)
+
+    array.push(pat_history, current_pat)
+    f_manage_drawings(max_patterns)
+
+// ── ALERTCONDITION (alertas nativas sin webhook) ─────────────────────────────
+bool _new_bull = _is_new_pattern and res.isBullish
+bool _new_bear = _is_new_pattern and not res.isBullish
+alertcondition(_new_bull, "Bullish Pattern Detected", "Patrón alcista confirmado — revisar entry/SL/TP en el gráfico")
+alertcondition(_new_bear, "Bearish Pattern Detected", "Patrón bajista confirmado — revisar entry/SL/TP en el gráfico")
+
+// ── EXPORTACIÓN DEL MODELO (canal federado) ──────────────────────────────────
+// Se emite en la última barra confirmada: tu webhook recibe el estado completo
+// del worker de este símbolo, listo para el agregador FedAvg.
+if fed_export and ml_en and barstate.islastconfirmedhistory and CNT.get(1) > 0
+    array<float> _sd_out = array.new<float>(N_FEAT, 0.0)
+    float _nrm = CNT.get(0)
+    for i = 0 to N_FEAT - 1
+        _sd_out.set(i, _nrm > 1 ? math.sqrt(F_M2.get(i) / (_nrm - 1)) : 0.0)
+    string _tps_out = str.tostring(nz(ADAPT_TP1, tp1_atr), "#.###") + "," + str.tostring(nz(ADAPT_TP2, tp2_atr), "#.###") + "," + str.tostring(nz(ADAPT_TP3, tp3_atr), "#.###") + "," + str.tostring(nz(ADAPT_SL, 1.0), "#.###")
+    string _payload = '{"type":"model_export","symbol":"' + syminfo.tickerid + '","tf":"' + timeframe.period +
+         '","n_norm":' + str.tostring(int(CNT.get(0))) +
+         ',"n_trained":' + str.tostring(int(CNT.get(1))) +
+         ',"logloss":' + str.tostring(CNT.get(2), "#.#####") +
+         ',"brier":' + str.tostring(CNT.get(3), "#.#####") +
+         ',"wins":' + str.tostring(stat_wins) + ',"losses":' + str.tostring(stat_losses) +
+         ',"n_mfe":' + str.tostring(MFE_MEM.size()) + ',"n_mae":' + str.tostring(MAE_WIN_MEM.size()) +
+         ',"W":"' + f_arr_to_csv(W) + '"' +
+         ',"MEAN":"' + f_arr_to_csv(F_MEAN) + '"' +
+         ',"SD":"' + f_arr_to_csv(_sd_out) + '"' +
+         ',"TPSL":"' + _tps_out + '"}'
+    alert(_payload, alert.freq_once_per_bar_close)
+
+// ── DASHBOARD (solo en la última barra — FIX #11 rendimiento) ────────────────
+_dpos = ui_pos == "Arriba izquierda" ? position.top_left : ui_pos == "Abajo derecha" ? position.bottom_right : ui_pos == "Abajo izquierda" ? position.bottom_left : position.top_right
+var table dash = table.new(_dpos, 2, 18,
+     border_width = 1,
+     border_color = color.rgb(50, 50, 70, 20),
+     frame_width  = 1,
+     frame_color  = color.rgb(60, 60, 90, 10))
+
+if barstate.islast
+    int   dash_piv_total  = array.size(pivotHighs) + array.size(pivotLows)
+    int   dash_bars_since = bar_index - dash_last_bar
+    float dash_vol_ratio  = vol_sma > 0 ? volume / vol_sma : 1.0
+    float dash_vol_score  = math.min(math.max((dash_vol_ratio - 1.0) / 4.0 * 10.0, 0.0), 10.0)
+    float dash_rr_raw     = not na(dash_entry) and not na(dash_stop) and not na(dash_tp2) and math.abs(dash_entry - dash_stop) > 0 ? math.abs(dash_tp2 - dash_entry) / math.abs(dash_entry - dash_stop) : 0.0
+    float dash_rr_score   = math.min(dash_rr_raw / 5.0 * 10.0, 10.0)
+    float dash_piv_score  = math.min(dash_piv_total / 20.0 * 10.0, 10.0)
+
+    int _tot_resolved = stat_wins + stat_losses
+    string _wr_str = _tot_resolved > 0 ? "W:" + str.tostring(stat_wins) + " L:" + str.tostring(stat_losses) + " (" + str.tostring(math.round(stat_wins * 100.0 / _tot_resolved)) + "%)" : "sin datos"
+    color  _wr_col = _tot_resolved == 0 ? color.rgb(140, 140, 140) : stat_wins * 100.0 / _tot_resolved >= 50 ? color.rgb(0, 255, 120) : color.rgb(255, 60, 80)
+    int _pw = nz(stat_wins_map.get(dash_pat_name))
+    int _pl2 = nz(stat_loss_map.get(dash_pat_name))
+    string _pat_wr = _pw + _pl2 > 0 ? "W:" + str.tostring(_pw) + " L:" + str.tostring(_pl2) + " (" + str.tostring(math.round(_pw * 100.0 / (_pw + _pl2))) + "%)" : "sin datos"
+
+    color hdrBg = color.rgb(30, 30, 45, 10)
+    color altBg = color.rgb(20, 20, 25, 10)
+    color oddBg = dash_bg_color
+    string dash_bias_str = dash_pat_bull ? "▲ Bull" : "▼ Bear"
+    color  dash_bias_col = dash_pat_bull ? color.rgb(0, 255, 120) : color.rgb(255, 60, 80)
+    string dash_atr_str  = atr_norm_en ? str.tostring(math.round(atr_val / syminfo.mintick), "##0") + " ticks" : str.tostring(atr_val, format.mintick)
+
+    // ── PANEL DEL CEREBRO ────────────────────────────────────────────────────
+    color _mlBg = color.rgb(28, 20, 45, 10)
+    // Baseline: log-loss de predecir siempre la tasa base. Si LogLoss < baseline, el modelo aporta.
+    float _base_rate = _tot_resolved > 0 ? math.max(0.02, math.min(0.98, stat_wins / float(_tot_resolved))) : 0.5
+    float _base_ll   = -(_base_rate * math.log(_base_rate) + (1 - _base_rate) * math.log(1 - _base_rate))
+    int   _mlLocal   = int(CNT.get(1))
+    // Muestras efectivas = las entrenadas aquí + las que trae el modelo importado.
+    // Sin sumar n_import, un modelo federado se mostraría "Aprendiendo (0/40)" para siempre.
+    int   _mlN       = _mlLocal + (FED_OK ? n_import : 0)
+    float _mlLoss    = CNT.get(2)
+    float _mlBrier   = CNT.get(3)
+    bool  _learning  = _mlN >= ml_warm and _mlLocal > 0 and _mlLoss < _base_ll
+    string _ml_state = not ml_en ? "OFF" : _mlN < ml_warm ? "📚 Aprendiendo (" + str.tostring(_mlN) + "/" + str.tostring(ml_warm) + ")" : _mlLocal == 0 ? "🌐 Importado (sin datos locales)" : _learning ? "✅ Con edge" : "⚠️ Sin edge vs base"
+    color  _ml_col   = not ml_en ? color.rgb(120,120,120) : _mlN < ml_warm ? color.rgb(200,200,60) : _learning ? color.rgb(0,255,120) : color.rgb(255,140,60)
+
+    if ui_compact
+        // ── MODO COMPACTO: solo lo que se mira antes de operar ───────────────
+        table.cell(dash, 0, 0, "  Detector v5", bgcolor=hdrBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 0, clean_ticker + " " + timeframe.period, bgcolor=hdrBg, text_color=dash_txt_color, text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 1, "  Patrón", bgcolor=altBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 1, dash_bias_str + " " + dash_pat_name, bgcolor=altBg, text_color=dash_bias_col, text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 2, "  Win-Rate", bgcolor=oddBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 2, _wr_str, bgcolor=oddBg, text_color=_wr_col, text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 3, "  🧠 Modelo", bgcolor=_mlBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 3, _ml_state, bgcolor=_mlBg, text_color=_ml_col, text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 4, "  TP (xATR)", bgcolor=_mlBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 4, na(ADAPT_TP1) ? "fijos" : str.tostring(ADAPT_TP1,"#.#") + "/" + str.tostring(ADAPT_TP2,"#.#") + "/" + str.tostring(ADAPT_TP3,"#.#"), bgcolor=_mlBg, text_color=color.rgb(0,255,160), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 5, "  Seguimiento", bgcolor=altBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 5, str.tostring(open_trades.size()) + " abiertos", bgcolor=altBg, text_color=color.rgb(140,180,255), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        for _r = 6 to 17
+            table.cell(dash, 0, _r, "", bgcolor=color.new(color.black, 100))
+            table.cell(dash, 1, _r, "", bgcolor=color.new(color.black, 100))
+    else
+        table.cell(dash, 0, 0,  "  Pattern Detector v2", bgcolor=hdrBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 0,  clean_ticker + " · " + timeframe.period, bgcolor=hdrBg, text_color=dash_txt_color, text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 1,  "  Pattern Bias",   bgcolor=altBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 1,  dash_bias_str,      bgcolor=altBg, text_color=dash_bias_col,  text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 2,  "  Active Pattern", bgcolor=oddBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 2,  dash_pat_name,      bgcolor=oddBg, text_color=dash_bias_col,  text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 3,  "  ATR (14)",       bgcolor=altBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 3,  dash_atr_str,       bgcolor=altBg, text_color=color.rgb(200, 200, 60), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 4,  "  Vol Spike",      bgcolor=oddBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 4,  f_blockBar(dash_vol_score), bgcolor=oddBg, text_color=f_blockColor(dash_vol_score), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 5,  "  R:R (vs TP2)",   bgcolor=altBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 5,  f_blockBar(dash_rr_score), bgcolor=altBg, text_color=f_blockColor(dash_rr_score), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 6,  "  Pivot Depth",    bgcolor=oddBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 6,  f_blockBar(dash_piv_score), bgcolor=oddBg, text_color=f_blockColor(dash_piv_score), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 7,  "  Bars Since Brk", bgcolor=altBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 7,  "⏳ " + str.tostring(dash_bars_since) + " Bars", bgcolor=altBg, text_color=color.rgb(140, 180, 255), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 8,  "  Detect Latency", bgcolor=oddBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 8,  na(dash_latency) ? "—" : str.tostring(dash_latency) + " bars", bgcolor=oddBg, text_color=color.rgb(140, 180, 255), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 9,  "  Win-Rate Global (TP1)", bgcolor=altBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 9,  _wr_str,            bgcolor=altBg, text_color=_wr_col, text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 10, "  " + dash_pat_name + " W/L", bgcolor=oddBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 10, _pat_wr,            bgcolor=oddBg, text_color=dash_txt_color, text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 11, "  Open Trades",    bgcolor=altBg, text_color=dash_txt_color, text_halign=text.align_left,  text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 11, str.tostring(open_trades.size()) + " | TP2:" + str.tostring(stat_tp2hits) + " TP3:" + str.tostring(stat_tp3hits) + " Exp:" + str.tostring(stat_expired), bgcolor=altBg, text_color=color.rgb(140, 180, 255), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+
+
+        table.cell(dash, 0, 12, "  🧠 Estado Modelo", bgcolor=_mlBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 12, _ml_state, bgcolor=_mlBg, text_color=_ml_col, text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 13, "  LogLoss / Converg.", bgcolor=_mlBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 13, _mlN > 0 ? str.tostring(_mlLoss, "#.###") + " / " + str.tostring(_base_ll, "#.###") + "  Δw " + str.tostring(CNT.get(4), "#.####") + (CNT.get(4) < 0.01 and _mlN > 60 ? " ✔convergido" : "") : "—", bgcolor=_mlBg, text_color=_ml_col, text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 14, "  TP adaptativos (×ATR)", bgcolor=_mlBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 14, na(ADAPT_TP1) ? "fijos " + str.tostring(tp1_atr,"#.#") + "/" + str.tostring(tp2_atr,"#.#") + "/" + str.tostring(tp3_atr,"#.#") : str.tostring(ADAPT_TP1,"#.##") + " / " + str.tostring(ADAPT_TP2,"#.##") + " / " + str.tostring(ADAPT_TP3,"#.##") + "  n=" + str.tostring(MFE_MEM.size()), bgcolor=_mlBg, text_color=color.rgb(0,255,160), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 15, "  Cosecha / Abiertos", bgcolor=_mlBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 15, "vistos:" + str.tostring(SEEN_BRK.size()) + "  abiertos:" + str.tostring(open_trades.size()) + "  SL:" + (na(ADAPT_SL) ? "estr." : str.tostring(ADAPT_SL, "#.##")), bgcolor=_mlBg, text_color=color.rgb(255,120,150), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+
+        // ── PANEL FEDERADO ───────────────────────────────────────────────────────
+        color _fedBg = color.rgb(18, 32, 45, 10)
+        string _fed_str = fed_mode == "Local (entrenar)" ? "🔒 Local · solo este símbolo" : FED_OK ? (fed_can_train ? "🌐 Híbrido · base n=" + str.tostring(n_import) : "🌐 Importado · n=" + str.tostring(n_import)) : "⚠️ Import inválido → usando local"
+        color  _fed_col = fed_mode == "Local (entrenar)" ? color.rgb(160,160,160) : FED_OK ? color.rgb(0,200,255) : color.rgb(255,140,60)
+        table.cell(dash, 0, 16, "  🌐 Modo Federado", bgcolor=_fedBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 16, _fed_str, bgcolor=_fedBg, text_color=_fed_col, text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 0, 17, "  Benchmark régimen", bgcolor=_fedBg, text_color=dash_txt_color, text_halign=text.align_left, text_font_family=font.family_monospace, text_size=size.small)
+        table.cell(dash, 1, 17, not bm_en ? "off" : str.tostring(bm_align, "#.##") + " ATR · vol " + str.tostring(bm_vol, "#.##"), bgcolor=_fedBg, text_color=bm_align >= 0 ? color.rgb(0,255,120) : color.rgb(255,60,80), text_halign=text.align_right, text_font_family=font.family_monospace, text_size=size.small)

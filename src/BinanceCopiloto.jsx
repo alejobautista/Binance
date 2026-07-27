@@ -5,6 +5,8 @@ import {
   recordSignal, markTaken, saveMyOp, myLevels, getSignals, probability, resolveOpenSignals,
   stats as trackerStats, runBacktest, exportJSON, importJSON, clearAll, getBtSample,
 } from "./tracker.js";
+import { getPatternBrain, setPatternBrain } from "./patternTracker.js";
+import { exportBrain, importBrain } from "./patternBrain.js";
 import { CandleChart, EquityCurve } from "./Chart.jsx";
 
 /* ---------- UI helpers ---------- */
@@ -150,6 +152,144 @@ const factorLabel = (name) =>
   FACTOR_LABELS[name] ??
   (name.startsWith("subcat:") ? `categoria ${name.slice(7)}`
     : name.startsWith("estrategia:") ? `estrategia ${name.slice(11)}` : name);
+
+/* Panel del cerebro DEDICADO a patrones: estado de aprendizaje, calidad del modelo,
+   objetivos que aprendio y canal federado para compartir pesos entre activos. */
+function PatternBrainPanel({ C: T, stats: b, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [txt, setTxt] = useState("");
+  const [msg, setMsg] = useState(null);
+  if (!b) return null;
+
+  const doExport = () => {
+    const json = JSON.stringify(exportBrain(getPatternBrain()), null, 2);
+    setTxt(json);
+    setOpen(true);
+    if (navigator?.clipboard) navigator.clipboard.writeText(json).catch(() => {});
+    setMsg({ ok: true, t: "Modelo exportado (y copiado al portapapeles)." });
+  };
+  const doImport = () => {
+    const brain = getPatternBrain();
+    const res = importBrain(brain, txt.trim(), { keepTraining: true });
+    if (res.ok) {
+      setPatternBrain(brain);
+      setMsg({ ok: true, t: "Pesos importados. Este simbolo parte del modelo consolidado y sigue afinando." });
+      onChange?.();
+    } else {
+      setMsg({ ok: false, t: `No se importo: ${res.reason}. El modelo local queda intacto.` });
+    }
+  };
+
+  const pct = (v) => (v == null ? "-" : `${(v * 100).toFixed(0)}%`);
+  const num = (v, d = 2) => (v == null ? "-" : v.toFixed(d));
+  const estadoCol = !b.ready ? T.amber : b.edge ? T.green : T.red;
+
+  return (
+    <div style={{
+      background: T.panel, border: `1px solid ${b.edge ? T.green : T.border}`,
+      borderRadius: 4, padding: 14, marginBottom: 16,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ color: T.dim, fontSize: 10, letterSpacing: "0.1em" }}>
+          🧠 CEREBRO DE PATRONES (dedicado, independiente del modelo general)
+        </div>
+        <button onClick={() => setOpen((o) => !o)} style={{
+          background: "transparent", border: `1px solid ${T.border}`, color: T.dim,
+          borderRadius: 3, padding: "3px 8px", fontSize: 10, cursor: "pointer",
+        }}>{open ? "ocultar" : "federado"}</button>
+      </div>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 18, fontSize: 12 }}>
+        <div>
+          <div style={{ color: T.dim, fontSize: 10 }}>ESTADO</div>
+          <div style={{ color: estadoCol, fontWeight: 700 }}>{b.estado}</div>
+        </div>
+        <div>
+          <div style={{ color: T.dim, fontSize: 10 }}>TRADES APRENDIDOS</div>
+          <div style={{ fontWeight: 700 }}>{b.n}
+            <span style={{ color: T.dim, fontSize: 10 }}> ({b.pasos} pasos)</span>
+          </div>
+        </div>
+        <div>
+          <div style={{ color: T.dim, fontSize: 10 }}>WIN-RATE COSECHA</div>
+          <div style={{ color: b.winRate >= 0.5 ? T.green : T.red, fontWeight: 700 }}>
+            {pct(b.winRate)} <span style={{ color: T.dim, fontSize: 10 }}>W{b.wins}/L{b.losses}</span>
+          </div>
+        </div>
+        <div>
+          <div style={{ color: T.dim, fontSize: 10 }}>LOG-LOSS vs BASE</div>
+          <div style={{ color: estadoCol, fontWeight: 700 }}>
+            {num(b.logloss, 3)} / {num(b.baseline, 3)}
+          </div>
+        </div>
+        <div>
+          <div style={{ color: T.dim, fontSize: 10 }}>TP APRENDIDOS (×ATR)</div>
+          <div style={{ color: T.green, fontWeight: 700 }}>
+            {b.tp?.[0] == null ? "fijos" : b.tp.map((v) => num(v, 1)).join(" / ")}
+            {b.sl != null && <span style={{ color: T.dim, fontSize: 10 }}> · SL {num(b.sl, 2)}</span>}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ color: T.dim, fontSize: 11, marginTop: 8, lineHeight: 1.5 }}>
+        {!b.ready
+          ? `Necesita ${40 - b.n} trades resueltos mas antes de filtrar senales. Corre el backtest con la estrategia PATRONES para sembrarlo: cosecha TODAS las figuras del historico, no solo las que se dibujan.`
+          : b.edge
+            ? "El modelo predice mejor que apostar siempre a la tasa base: su p(win) aporta informacion real."
+            : "El modelo AUN no supera a la tasa base. Trata su p(win) con escepticismo y sigue sembrando muestras."}
+      </div>
+
+      {b.porPatron?.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ color: T.dim, fontSize: 10, letterSpacing: "0.1em", marginBottom: 4 }}>WIN-RATE POR FIGURA</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {b.porPatron.slice(0, 12).map((p) => (
+              <span key={p.name} style={{
+                fontSize: 10, padding: "2px 6px", borderRadius: 3,
+                border: `1px solid ${T.border}`,
+                color: p.n < 5 ? T.dim : p.wr >= 0.5 ? T.green : T.red,
+              }}>
+                {p.name} {(p.wr * 100).toFixed(0)}% <span style={{ color: T.dim }}>n={p.n}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {open && (
+        <div style={{ marginTop: 12, borderTop: `1px solid ${T.border}`, paddingTop: 10 }}>
+          <div style={{ color: T.dim, fontSize: 11, lineHeight: 1.5, marginBottom: 8 }}>
+            Canal federado: exporta los pesos de este dispositivo, promedialos con los de otros
+            activos o equipos, y vuelve a importarlos. Las features son adimensionales o estan
+            normalizadas por ATR, asi que un modelo entrenado en un simbolo sirve en otro.
+          </div>
+          <textarea
+            value={txt} onChange={(e) => setTxt(e.target.value)}
+            placeholder='Pega aqui el JSON del modelo (con W, MEAN, SD, TPSL) para importarlo'
+            style={{
+              width: "100%", minHeight: 90, background: T.panel2, color: T.text,
+              border: `1px solid ${T.border}`, borderRadius: 3, padding: 8,
+              fontSize: 10, fontFamily: "monospace", resize: "vertical",
+            }} />
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button onClick={doExport} style={{
+              background: T.accent, border: "none", color: "#fff", borderRadius: 3,
+              padding: "6px 12px", fontSize: 11, cursor: "pointer", fontWeight: 700,
+            }}>Exportar pesos</button>
+            <button onClick={doImport} disabled={!txt.trim()} style={{
+              background: "transparent", border: `1px solid ${T.border}`,
+              color: txt.trim() ? T.text : T.dim, borderRadius: 3,
+              padding: "6px 12px", fontSize: 11, cursor: txt.trim() ? "pointer" : "default",
+            }}>Importar pesos</button>
+          </div>
+          {msg && (
+            <div style={{ color: msg.ok ? T.green : T.red, fontSize: 11, marginTop: 8 }}>{msg.t}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function BinanceCopiloto() {
   const [tab, setTab] = useState("scan");
@@ -1205,6 +1345,49 @@ export default function BinanceCopiloto() {
                 </div>
               )}
 
+              {/* p(win) del cerebro DEDICADO: solo existe en la estrategia de patrones y es
+                  independiente de la probabilidad historica general de abajo. */}
+              {analysis.modo === "patrones" && analysis.brain && (
+                <div style={{
+                  background: C.panel, border: `1px solid ${C.border}`,
+                  borderLeft: `4px solid ${analysis.brain.edge ? C.green : C.amber}`,
+                  borderRadius: 4, padding: 14, marginBottom: 14,
+                }}>
+                  <div style={{ color: C.dim, fontSize: 10, letterSpacing: "0.1em", marginBottom: 8 }}>
+                    🧠 CEREBRO DE PATRONES — p(win) de ESTA figura
+                  </div>
+                  {analysis.pwin != null && analysis.brain.n >= 40 ? (
+                    <>
+                      <span style={{
+                        fontSize: 24, fontWeight: 700,
+                        color: analysis.pwin >= 0.55 ? C.green : analysis.pwin <= 0.45 ? C.red : C.text,
+                      }}>
+                        {(analysis.pwin * 100).toFixed(0)}%
+                      </span>
+                      <span style={{ color: C.dim, fontSize: 11, marginLeft: 8 }}>
+                        {analysis.brain.estado} · {analysis.brain.n} trades · log-loss{" "}
+                        {analysis.brain.logloss?.toFixed(3)} vs base {analysis.brain.baseline?.toFixed(3)}
+                      </span>
+                      {analysis.factores?.length > 0 && (
+                        <div style={{ color: C.dim, fontSize: 11, marginTop: 6 }}>
+                          {analysis.factores.map((f, i) => (
+                            <span key={i} style={{ marginRight: 10, color: f.sube ? C.green : C.red }}>
+                              {f.sube ? "▲" : "▼"} {f.name}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div style={{ color: C.dim, fontSize: 12, lineHeight: 1.5 }}>
+                      Sin datos suficientes ({analysis.brain.n}/40 trades resueltos). Mientras tanto su
+                      p(win) seria ~50% para todo: mostrarlo como porcentaje invitaria a confiar en un
+                      numero vacio. Corre el backtest con la estrategia PATRONES para sembrarlo.
+                    </div>
+                  )}
+                </div>
+              )}
+
               {analysis.dir && prob && (
                 <div style={{
                   background: C.panel, border: `1px solid ${C.border}`, borderLeft: `4px solid ${C.amber}`,
@@ -1923,6 +2106,8 @@ export default function BinanceCopiloto() {
               </div>
             </div>
           </div>
+
+          <PatternBrainPanel C={C} stats={recStats.patternBrain} onChange={() => setTrackerTick((t) => t + 1)} />
 
           {recStats.misOps.n > 0 && (
             <div style={{
